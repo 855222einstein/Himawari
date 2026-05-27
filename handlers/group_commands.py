@@ -15,6 +15,7 @@ from pyrogram.types import (
 from pyrogram.enums import ChatMemberStatus
 import logging
 import re
+import time
 import db
 from plugin.group_guard.group_guard import group_is_approved
 
@@ -22,6 +23,28 @@ DEFAULT_WELCOME = "👋 Welcome {mention} to {title}!"
 
 logger = logging.getLogger(__name__)
 logger.setLevel(logging.INFO)
+
+# Prevent duplicate welcome messages when Telegram/Pyrogram emits both
+# chat_member_updated and new_chat_members for the same join event.
+_RECENT_WELCOMES = {}
+WELCOME_DEDUPE_SECONDS = 15
+
+
+def _is_duplicate_welcome(chat_id: int, user_id: int) -> bool:
+    now = time.monotonic()
+    key = (chat_id, user_id)
+
+    # cleanup old cache entries
+    for old_key, ts in list(_RECENT_WELCOMES.items()):
+        if now - ts > WELCOME_DEDUPE_SECONDS:
+            _RECENT_WELCOMES.pop(old_key, None)
+
+    last_seen = _RECENT_WELCOMES.get(key)
+    if last_seen and now - last_seen <= WELCOME_DEDUPE_SECONDS:
+        return True
+
+    _RECENT_WELCOMES[key] = now
+    return False
 
 
 async def _check_approved(message) -> bool:
@@ -160,6 +183,9 @@ async def handle_welcome(client, chat_id: int, users: list, chat_title: str):
     reply_markup = await build_welcome_keyboard(chat_id)
 
     for user in users:
+        if _is_duplicate_welcome(chat_id, user.id):
+            continue
+
         try:
             text = welcome_text.format(
                 first_name=user.first_name or "",
@@ -193,6 +219,8 @@ def register_group_commands(app: Client):
     async def member_update(client: Client, cmu: ChatMemberUpdated):
         if not cmu.new_chat_member:
             return
+        if not await group_is_approved(cmu.chat.id):
+            return  # silently skip unapproved groups
 
         user = cmu.new_chat_member.user
         old_status = cmu.old_chat_member.status if cmu.old_chat_member else None
