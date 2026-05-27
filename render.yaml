@@ -1,0 +1,10 @@
+services:
+  - type: web
+    name: NomadeHelpBot
+    runtime: docker
+    plan: free
+    envVars:
+      - key: PYTHONUNBUFFERED
+        value: "1"
+      - key: PORT
+        value: "8080"
