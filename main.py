@@ -12,6 +12,7 @@ from config import API_ID, API_HASH, BOT_TOKEN, LOG_CHAT_ID
 from security import verify_integrity, get_runtime_key
 from handlers import register_all_handlers
 from log_utils import send_startup_log, log_command, send_log, init_bot_info
+from health_server import start_health_server
 
 logging.basicConfig(
     format="[%(levelname) 5s/%(asctime)s] %(name)s: %(message)s",
@@ -59,6 +60,7 @@ async def command_logger(client: Client, message: Message):
 
 
 async def boot():
+    start_health_server()  # Bind port for Render Web Service
     register_all_handlers(app)
     await app.start()
 
