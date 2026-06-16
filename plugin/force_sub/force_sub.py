@@ -168,11 +168,18 @@ async def _user_subscribed(client, user_id: int, channel: str) -> bool:
     except UserNotParticipant:
         return False
     except (ChatAdminRequired, ChannelPrivate) as e:
-        logger.warning("Cannot check %s membership: %s", channel, e)
+        # Bot genuinely cannot check this channel (kicked, no rights, etc).
+        # Fail OPEN here only — this is a config/permission problem, not a
+        # signal about the user, and blocking everyone would be worse.
+        logger.warning("Cannot check %s membership (admin/access issue): %s", channel, e)
         return True
     except Exception as e:
-        logger.warning("Membership check error %s / %s: %s", channel, user_id, e)
-        return True
+        # Telegram raises things like PeerIdInvalid / UsernameNotOccupied for
+        # users who have NEVER interacted with the channel — not just
+        # UserNotParticipant. Treat any unrecognized error as "not joined";
+        # failing open here is what silently disabled force-sub before.
+        logger.warning("Membership check error %s / %s — treating as NOT joined: %s", channel, user_id, e)
+        return False
 
 
 async def _get_unjoined(client, user_id: int, channels: list) -> list:
