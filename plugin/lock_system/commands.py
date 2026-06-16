@@ -16,10 +16,8 @@ async def can_use_lock(client, chat_id, user_id):
 
 
 async def get_current_permissions(client, chat_id):
-    """Current group permissions fetch karo"""
     chat = await client.get_chat(chat_id)
-    perms = chat.permissions
-    return perms
+    return chat.permissions
 
 
 def register_lock_system(app):
@@ -31,39 +29,34 @@ def register_lock_system(app):
             return
 
         if not await group_is_approved(message.chat.id):
-            return await message.reply_text("⏳ This group is **pending approval**. Commands are disabled.")
+            return await message.reply_text("ᴛʜɪꜱ ɢʀᴏᴜᴘ ɪꜱ ᴘᴇɴᴅɪɴɢ ᴀᴘᴘʀᴏᴠᴀʟ.")
 
         if not await can_use_lock(client, message.chat.id, message.from_user.id):
-            return await message.reply_text("❌ Only admins can use this command.")
+            return await message.reply_text("ᴀᴅᴍɪɴꜱ ᴏɴʟʏ.")
 
         if len(message.command) < 2:
             return await message.reply_text(
-                "⚠️ Available: url, sticker, media, username, forward, all"
+                "ᴀᴠᴀɪʟᴀʙʟᴇ : url  sticker  media  username  forward  all"
             )
 
         lock_type = message.command[1].lower()
 
-        # ── LOCK ALL ──────────────────────────────────────────
         if lock_type == "all":
             current = await get_current_permissions(client, message.chat.id)
-
-            # Already fully locked check
             if not current.can_send_messages:
-                return await message.reply_text("ℹ️ Group already fully locked.")
-
+                return await message.reply_text("ɢʀᴏᴜᴘ ᴀʟʀᴇᴀᴅʏ ꜰᴜʟʟʏ ʟᴏᴄᴋᴇᴅ.")
             try:
                 await client.set_chat_permissions(
                     message.chat.id,
                     ChatPermissions(can_send_messages=False)
                 )
-                return await message.reply_text("🔒 Group fully locked.")
+                return await message.reply_text("ɢʀᴏᴜᴘ ꜰᴜʟʟʏ ʟᴏᴄᴋᴇᴅ.")
             except Exception as e:
-                return await message.reply_text(f"❌ Failed to lock group:\n{e}")
+                return await message.reply_text(f"ꜰᴀɪʟᴇᴅ ᴛᴏ ʟᴏᴄᴋ ɢʀᴏᴜᴘ.\n{e}")
 
-        # ── OTHER LOCKS ───────────────────────────────────────
         if lock_type not in VALID_LOCKS:
             return await message.reply_text(
-                "⚠️ Available: url, sticker, media, username, forward, all"
+                "ᴀᴠᴀɪʟᴀʙʟᴇ : url  sticker  media  username  forward  all"
             )
 
         current = await get_current_permissions(client, message.chat.id)
@@ -71,7 +64,7 @@ def register_lock_system(app):
         try:
             if lock_type == "media":
                 if not current.can_send_media_messages:
-                    return await message.reply_text("ℹ️ Media already locked.")
+                    return await message.reply_text("ᴍᴇᴅɪᴀ ᴀʟʀᴇᴀᴅʏ ʟᴏᴄᴋᴇᴅ.")
                 await client.set_chat_permissions(
                     message.chat.id,
                     ChatPermissions(
@@ -86,7 +79,7 @@ def register_lock_system(app):
 
             elif lock_type == "sticker":
                 if not current.can_send_other_messages:
-                    return await message.reply_text("ℹ️ Stickers already locked.")
+                    return await message.reply_text("ꜱᴛɪᴄᴋᴇʀꜱ ᴀʟʀᴇᴀᴅʏ ʟᴏᴄᴋᴇᴅ.")
                 await client.set_chat_permissions(
                     message.chat.id,
                     ChatPermissions(
@@ -100,13 +93,12 @@ def register_lock_system(app):
                 )
 
             elif lock_type in ["url", "forward", "username"]:
-                # These are handled by lock_url / group_guard plugins
-                return await message.reply_text(f"🔒 Locked {lock_type}.")
+                return await message.reply_text(f"ʟᴏᴄᴋᴇᴅ : {lock_type}")
 
-            return await message.reply_text(f"🔒 Locked {lock_type}.")
+            return await message.reply_text(f"ʟᴏᴄᴋᴇᴅ : {lock_type}")
 
         except Exception as e:
-            return await message.reply_text(f"❌ Failed to lock {lock_type}:\n{e}")
+            return await message.reply_text(f"ꜰᴀɪʟᴇᴅ ᴛᴏ ʟᴏᴄᴋ {lock_type}.\n{e}")
 
 
     @app.on_message(filters.command("unlock") & filters.group)
@@ -116,31 +108,27 @@ def register_lock_system(app):
             return
 
         if not await group_is_approved(message.chat.id):
-            return await message.reply_text("⏳ This group is **pending approval**. Commands are disabled.")
+            return await message.reply_text("ᴛʜɪꜱ ɢʀᴏᴜᴘ ɪꜱ ᴘᴇɴᴅɪɴɢ ᴀᴘᴘʀᴏᴠᴀʟ.")
 
         if not await can_use_lock(client, message.chat.id, message.from_user.id):
-            return await message.reply_text("❌ Only admins can use this command.")
+            return await message.reply_text("ᴀᴅᴍɪɴꜱ ᴏɴʟʏ.")
 
         if len(message.command) < 2:
             return await message.reply_text(
-                "⚠️ Available: url, sticker, media, username, forward, all"
+                "ᴀᴠᴀɪʟᴀʙʟᴇ : url  sticker  media  username  forward  all"
             )
 
         lock_type = message.command[1].lower()
 
-        # ── UNLOCK ALL ────────────────────────────────────────
         if lock_type == "all":
             current = await get_current_permissions(client, message.chat.id)
-
-            # Already fully unlocked check
             if (
                 current.can_send_messages
                 and current.can_send_media_messages
                 and current.can_send_other_messages
                 and current.can_add_web_page_previews
             ):
-                return await message.reply_text("ℹ️ Group already fully unlocked.")
-
+                return await message.reply_text("ɢʀᴏᴜᴘ ᴀʟʀᴇᴀᴅʏ ꜰᴜʟʟʏ ᴜɴʟᴏᴄᴋᴇᴅ.")
             try:
                 await client.set_chat_permissions(
                     message.chat.id,
@@ -153,14 +141,13 @@ def register_lock_system(app):
                         can_invite_users=True,
                     ),
                 )
-                return await message.reply_text("🔓 Group fully unlocked.")
+                return await message.reply_text("ɢʀᴏᴜᴘ ꜰᴜʟʟʏ ᴜɴʟᴏᴄᴋᴇᴅ.")
             except Exception as e:
-                return await message.reply_text(f"❌ Failed to unlock group:\n{e}")
+                return await message.reply_text(f"ꜰᴀɪʟᴇᴅ ᴛᴏ ᴜɴʟᴏᴄᴋ ɢʀᴏᴜᴘ.\n{e}")
 
-        # ── OTHER UNLOCKS ─────────────────────────────────────
         if lock_type not in VALID_LOCKS:
             return await message.reply_text(
-                "⚠️ Available: url, sticker, media, username, forward, all"
+                "ᴀᴠᴀɪʟᴀʙʟᴇ : url  sticker  media  username  forward  all"
             )
 
         current = await get_current_permissions(client, message.chat.id)
@@ -168,7 +155,7 @@ def register_lock_system(app):
         try:
             if lock_type == "media":
                 if current.can_send_media_messages:
-                    return await message.reply_text("ℹ️ Media already unlocked.")
+                    return await message.reply_text("ᴍᴇᴅɪᴀ ᴀʟʀᴇᴀᴅʏ ᴜɴʟᴏᴄᴋᴇᴅ.")
                 await client.set_chat_permissions(
                     message.chat.id,
                     ChatPermissions(
@@ -183,7 +170,7 @@ def register_lock_system(app):
 
             elif lock_type == "sticker":
                 if current.can_send_other_messages:
-                    return await message.reply_text("ℹ️ Stickers already unlocked.")
+                    return await message.reply_text("ꜱᴛɪᴄᴋᴇʀꜱ ᴀʟʀᴇᴀᴅʏ ᴜɴʟᴏᴄᴋᴇᴅ.")
                 await client.set_chat_permissions(
                     message.chat.id,
                     ChatPermissions(
@@ -197,9 +184,9 @@ def register_lock_system(app):
                 )
 
             elif lock_type in ["url", "forward", "username"]:
-                return await message.reply_text(f"🔓 Unlocked {lock_type}.")
+                return await message.reply_text(f"ᴜɴʟᴏᴄᴋᴇᴅ : {lock_type}")
 
-            return await message.reply_text(f"🔓 Unlocked {lock_type}.")
+            return await message.reply_text(f"ᴜɴʟᴏᴄᴋᴇᴅ : {lock_type}")
 
         except Exception as e:
-            return await message.reply_text(f"❌ Failed to unlock {lock_type}:\n{e}")
+            return await message.reply_text(f"ꜰᴀɪʟᴇᴅ ᴛᴏ ᴜɴʟᴏᴄᴋ {lock_type}.\n{e}")
