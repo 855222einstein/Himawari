@@ -44,7 +44,7 @@ async def set_autodelete(chat_id: int, mode: str, seconds: int, enabled: bool = 
 async def get_autodelete(chat_id: int) -> dict:
     """
     Returns the autodelete config dict for a chat.
-    Keys: enabled (bool), mode (str), seconds (int)
+    Keys: enabled (bool), mode (str), seconds (int), skip_admins (bool)
     Returns default (disabled) if not found.
     """
     data = await db.autodelete.find_one({"chat_id": chat_id})
@@ -53,8 +53,9 @@ async def get_autodelete(chat_id: int) -> dict:
             "enabled": data.get("enabled", False),
             "mode": data.get("mode", "all"),
             "seconds": data.get("seconds", 0),
+            "skip_admins": data.get("skip_admins", False),
         }
-    return {"enabled": False, "mode": "all", "seconds": 0}
+    return {"enabled": False, "mode": "all", "seconds": 0, "skip_admins": False}
 
 
 async def disable_autodelete(chat_id: int):
@@ -69,3 +70,22 @@ async def disable_autodelete(chat_id: int):
 async def delete_autodelete_config(chat_id: int):
     """Fully remove autodelete config for a chat."""
     await db.autodelete.delete_one({"chat_id": chat_id})
+
+
+# ==========================================================
+# 🛡️ Skip-Admins Setting
+# ==========================================================
+
+async def get_skip_admins(chat_id: int) -> bool:
+    """Returns True if admin messages should be skipped from auto-delete."""
+    data = await db.autodelete.find_one({"chat_id": chat_id})
+    return bool(data.get("skip_admins", False)) if data else False
+
+
+async def set_skip_admins(chat_id: int, value: bool):
+    """Enable or disable the skip-admins exemption for a chat."""
+    await db.autodelete.update_one(
+        {"chat_id": chat_id},
+        {"$set": {"skip_admins": value}},
+        upsert=True,
+    )

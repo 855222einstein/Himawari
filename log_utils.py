@@ -7,11 +7,22 @@ from typing import Optional, Union
 import aiohttp
 from pyrogram import Client
 
-from config import LOG_CHAT_ID, BOT_USERNAME, BOT_TOKEN
+from config import LOG_CHAT_ID, BOT_TOKEN
 
 logger = logging.getLogger(__name__)
 
 _LOG_DISABLED = False
+
+# Set at startup by init_bot_info() — uses real Telegram bot name everywhere
+_BOT_NAME: str = "Bot"
+_BOT_USERNAME: str = ""
+
+
+def init_bot_info(first_name: str, username: str) -> None:
+    """Call once after app.start() with the live bot identity."""
+    global _BOT_NAME, _BOT_USERNAME
+    _BOT_NAME = first_name or "Bot"
+    _BOT_USERNAME = f"@{username}" if username else ""
 
 
 def _escape(value) -> str:
@@ -64,27 +75,27 @@ async def send_log(client: Client, text: str, *, disable_web_page_preview: bool 
 
 
 async def send_startup_log(client: Client) -> None:
-    """Startup report — plain text, small caps style, no image."""
+    """Send startup report to log channel using the bot's live Telegram identity."""
     chat_id = _chat_id()
     if not chat_id:
+        logger.info("LOG_CHAT_ID not set — startup log skipped.")
         return
 
     try:
-        bot = await client.get_me()
-        bot_name     = bot.first_name or BOT_USERNAME
-        bot_username = f"@{bot.username}" if bot.username else BOT_USERNAME
         pyrogram_version = __import__("pyrogram").__version__
-
-        # ── Small caps startup message ───────────────────────
         started_date = datetime.utcnow().strftime("%Y-%m-%d")
+
+        # Convert bot name to small caps for the header
+        name_display = _BOT_NAME
+        username_display = _BOT_USERNAME or "ɴᴏɴᴇ"
 
         caption = (
             "━━━━━━━━━━━━━━━━━━\n\n"
-            "ʜɪᴍᴀᴡᴀʀɪ ʜᴇʟᴘ ʙᴏᴛ\n\n"
+            f"{name_display}\n\n"
             "━━━━━━━━━━━━━━━━━━\n\n"
             f"ꜱᴛᴀᴛᴜꜱ      : ᴏɴʟɪɴᴇ\n"
-            f"ʙᴏᴛ         : {bot_name}\n"
-            f"ᴜꜱᴇʀɴᴀᴍᴇ    : {bot_username}\n\n"
+            f"ʙᴏᴛ         : {name_display}\n"
+            f"ᴜꜱᴇʀɴᴀᴍᴇ    : {username_display}\n\n"
             "━━━━━━━━━━━━━━━━━━\n\n"
             f"ᴘʏᴛʜᴏɴ      : v{platform.python_version()}\n"
             f"ᴘʏʀᴏɢʀᴀᴍ    : v{pyrogram_version}\n"
@@ -93,13 +104,9 @@ async def send_startup_log(client: Client) -> None:
             f"ꜱᴛᴀʀᴛᴇᴅ     : {started_date}\n"
             "ᴄᴏʀᴇ        : ᴀᴄᴛɪᴠᴇ\n"
             "ꜱᴛᴀᴛᴇ       : ꜱᴛᴀʙʟᴇ\n\n"
-            "━━━━━━━━━━━━━━━━━━\n\n"
-            "ʜɪᴍᴀᴡᴀʀɪ ᴘᴏᴡᴇʀ\n"
-            "ᴀᴄᴛɪᴠᴀᴛᴇᴅ\n\n"
             "━━━━━━━━━━━━━━━━━━"
         )
 
-        # Send as plain text — no image
         ok, info = await _bot_api(
             "sendMessage",
             {
@@ -111,13 +118,15 @@ async def send_startup_log(client: Client) -> None:
         )
         if not ok:
             logger.info("Startup log skipped: %s", info)
+        else:
+            logger.info("Startup log sent to log channel.")
 
     except Exception as exc:
         logger.info("Startup log skipped: %s", exc)
 
 
 async def log_command(client: Client, message) -> None:
-    """Log commands and private messages without breaking normal handlers."""
+    """Log commands and private messages to the log channel."""
     if not LOG_CHAT_ID or not message or not message.from_user:
         return
 
@@ -132,7 +141,7 @@ async def log_command(client: Client, message) -> None:
 
     log_text = (
         "━━━━━━━━━━━━━━━━━━\n\n"
-        "ʜɪᴍᴀᴡᴀʀɪ ʙᴏᴛ ʟᴏɢ\n\n"
+        f"{_BOT_NAME} ʟᴏɢ\n\n"
         "━━━━━━━━━━━━━━━━━━\n\n"
         f"ᴜꜱᴇʀ       : {_escape(user.first_name)}\n"
         f"ᴜꜱᴇʀ ɪᴅ    : {user.id}\n\n"
@@ -145,4 +154,3 @@ async def log_command(client: Client, message) -> None:
         "━━━━━━━━━━━━━━━━━━"
     )
     await send_log(client, log_text)
-

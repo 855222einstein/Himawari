@@ -1,0 +1,36 @@
+# Koyeb deployment config
+# Deploy via: koyeb app init himawari-bot --docker
+# Or use Koyeb dashboard > New Service > GitHub > select repo
+
+services:
+  - name: himawari-bot
+    type: worker
+    docker:
+      dockerfile: Dockerfile
+    env:
+      - key: API_ID
+        value: ""          # Fill in Koyeb dashboard > Secrets
+      - key: API_HASH
+        value: ""
+      - key: BOT_TOKEN
+        value: ""
+      - key: MONGO_URI
+        value: ""
+      - key: DB_NAME
+        value: "Cluster0"
+      - key: OWNER_ID
+        value: ""
+      - key: BOT_USERNAME
+        value: ""
+      - key: LOG_CHAT_ID
+        value: ""
+      - key: SUDO_USERS
+        value: ""
+      - key: START_IMAGE
+        value: ""
+      - key: SUPPORT_GROUP
+        value: ""
+      - key: UPDATE_CHANNEL
+        value: ""
+      - key: PYTHONUNBUFFERED
+        value: "1"
