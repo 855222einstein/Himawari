@@ -1,822 +1,393 @@
 # ============================================================
-# Force Subscribe System
-# plugin/force_sub/force_sub.py
-#
-# Features:
-# - /addfsub @channel or ID  → add a channel/group to force-sub list
-# - /rmfsub @channel or ID   → remove a channel/group from list
-# - /fsub on / off           → enable or disable force sub
-# - /fsublist                → show all force-sub channels for this group
-# - New members get warned + join button (auto-delete 30s)
-# - Messages from non-subscribers are deleted silently
-# - Supports @username AND numeric IDs (e.g. -1001234567890)
-# - Multiple channels/groups supported
+# Force Subscribe Plugin
+# Flow:
+#   1. New member joins → check subscription to all channels
+#   2. Not subscribed → MUTE user + show notice + "✅ I've Joined" button
+#   3. Subscribed → show welcome with channel buttons (no mute)
+#   4. Callback "fsub_verify:<chat_id>:<user_id>" → re-check → unmute + welcome
+# Commands:
+#   /setfsub  LABEL | @channel  LABEL2 | @channel2
+#   /clearfsub
+#   /setfsubmsg  <text>  (supports {mention} {first_name} {username} {title})
+#   /delfsubmsg
+#   /viewfsub
 # ============================================================
 
-import asyncio
-import hashlib
 import logging
-from datetime import datetime, timedelta
-from zoneinfo import ZoneInfo
-from pyrogram import Client, filters, enums
+import re
+from pyrogram import filters
+from pyrogram.enums import ChatMemberStatus
+from pyrogram.errors import UserNotParticipant, ChatAdminRequired, ChannelPrivate
 from pyrogram.types import (
     Message,
+    CallbackQuery,
     InlineKeyboardMarkup,
     InlineKeyboardButton,
-    ChatMemberUpdated,
     ChatPermissions,
 )
-from pyrogram.enums import ChatMemberStatus, ChatType
-from pyrogram.errors import UserNotParticipant, ChatAdminRequired, PeerIdInvalid, UserAdminInvalid
-
+import db
 from plugin.group_guard.group_guard import group_is_approved
-from plugin.force_sub.db_force_sub import (
-    set_force_sub,
-    get_force_sub,
-    disable_force_sub,
-    enable_force_sub,
-    add_force_sub_channel,
-    remove_force_sub_channel,
-    mark_force_sub_notice,
-    clear_force_sub_notice,
-    set_force_sub_message,
-    get_force_sub_message,
-    clear_all_force_sub_channels,
-    set_force_sub_channel_label,
-    get_force_sub_labels,
-)
 
 logger = logging.getLogger(__name__)
 
-BORDER = "━━━━━━━━━━━━━━━━━━━━"
+DEFAULT_FSUB_MSG = (
+    "Hey {mention} 👋\n\n"
+    "You need to join our channel(s) before using this group.\n\n"
+    "Please join all channels below, then tap **✅ I've Joined**."
+)
+
+MUTE_PERMISSIONS = ChatPermissions(
+    can_send_messages=False,
+    can_send_media_messages=False,
+    can_send_other_messages=False,
+    can_add_web_page_previews=False,
+)
+
+FULL_PERMISSIONS = ChatPermissions(
+    can_send_messages=True,
+    can_send_media_messages=True,
+    can_send_other_messages=True,
+    can_add_web_page_previews=True,
+)
 
 
-NOTICE_DELETE_SECONDS = 30
-STICKER_DELETE_SECONDS = 10
-MUTE_SECONDS = 30
-IST = ZoneInfo("Asia/Kolkata")
+# ── Helpers ───────────────────────────────────────────────────
 
-# Runtime throttle state, keyed by (chat_id, user_id):
-#   stage 0 -> force message just sent
-#   stage 1 -> user ignored it and sent again -> sticker sent
-#   stage 2 -> user ignored sticker too and sent again -> user muted 30s
-# Once `expires_at` passes, the cycle resets and a fresh force
-# message is shown the next time the user tries to chat.
-_FORCE_NOTICE_STATE = {}
-
-# Duplicate sticker IDs are skipped automatically.
-_FORCE_SUB_STICKERS_RAW = [
-    "CAACAgUAAxkBAAMKail5j184VypN5uOha5rRg2dJPxsAAm0VAAI-GflVgXogIGmIUZoeBA",
-    "CAACAgUAAxkBAAMMail7NYTQGA50wProtTQQkVm3RzIAAuAcAAKgInhWJuNkodC0RckeBA",
-    "CAACAgUAAxkBAAMOail7P_W4-9GUQUBh8MKYIodaw9oAAnkUAALujklVOHjXNcpSGEoeBA",
-    "CAACAgUAAxkBAAMQail7b5hyrRIo3_8yxVRvV2IvxC4AAqIWAAJ68olW1fjwcYyIpekeBA",
-    "CAACAgUAAxkBAAMSail7e3naQMRCkSqP_q4tFu0PcucAAisMAAKbQ_BUYlO7yJ5mCMEeBA",
-    "CAACAgUAAxkBAAMUail7fd3XM1tf1dp5g96c-2SCxWAAAkYQAAKJiPlU6f0rnJ6P0yceBA",
-    "CAACAgUAAxkBAAMYail7hg9RHEtZkctsaz5eoYdXJ-AAAnsOAAIuCwFVim60eOoCzDseBA",
-    "CAACAgUAAxkBAAMaail7lD4MARmj9OU00cYrldtx6L4AAikVAAJYKslVNIXBL7NC7p0eBA",
-    "CAACAgQAAxkBAAMcail7n1YYksUjYan3ESPMLWJu7YQAAmgVAAJmU7FT66oEPHt1-FMeBA",
-    "CAACAgQAAxkBAAMeail7oWhk6t7q7chFOye3hJhr1dwAAuUaAAK5BkFR5LS7HeEeAAH_HgQ",
-    "CAACAgQAAxkBAAMgail7opXWusM8I6e1ERhAFyN9zGMAArwPAAIl-EBRCWIoGs7F3ugeBA",
-    "CAACAgQAAxkBAAMiail7oyzFxiKvKWsgm3jayDzc2b0AAtwPAAIFzLhTY3hSxh26_5oeBA",
-    "CAACAgQAAxkBAAMkail7o7vAOJT-oQtLXhzg8e5mVL0AAowPAAI-ewABUNoyQziVBA8sHgQ",
-    "CAACAgQAAxkBAAMmail7pWEpp3JTsgojkUbPkFQ_qOMAAssVAAKu7ilTDHwqZT5wLcQeBA",
-    "CAACAgQAAxkBAAMoail7pv7HmAQh61BDYaQoOvtRGowAAjgPAAJ113hQ2gPCMIFDCREeBA",
-    "CAACAgQAAxkBAAMqail7qM4AATvYvou7Y7riomfXdQABXgACGhEAAujCcFDHVO-cIWfv3x4E",
-    "CAACAgQAAxkBAAMsail7qeGLjbRsS8eiadJ28DV2ZKoAAqUNAAIKskFSaiuEZPmFuSseBA",
-    "CAACAgQAAxkBAAMuail7qgO0Ps9ZuklDFof-Y8Shh7wAAg0UAAK87nlQEc4LvX3OTfoeBA",
-    "CAACAgQAAxkBAAMwail7rcVdH02-qfRqW8qVDCBdtaQAAo4PAAJnGWhQJBPPbFiEOEIeBA",
-    "CAACAgQAAxkBAAMyail7rhkWDsxd5wEP-aUEsAFEVekAAu4OAAKcX1hSX0DJLZWx9M4eBA",
-    "CAACAgQAAxkBAAM0ail7r7Ckb7Sx4oVAi7Me6ElXjN0AAtMWAAJ4gPBRQJdDlFUEjj8eBA",
-    "CAACAgQAAxkBAAM2ail7sBoq7L1TcvGr9rXLysIVgJMAAp8VAAIo41hQXxgectU3fdoeBA",
-    "CAACAgQAAxkBAAM4ail7sbJRexmEhBhqiG2CTbJICHcAAngUAAIbzllQrMIOmAlyPN8eBA",
-    "CAACAgQAAxkBAAM6ail7s77OzajeblA_abdzlaIkoOwAAq4RAAJ8CvFQZv7xhrhDDrUeBA",
-    "CAACAgQAAxkBAAM8ail7tH3AvwxYfcQVU9TPYQM6iBgAAqkYAAKgrFFSq6xrbz5QK2seBA",
-    "CAACAgQAAxkBAAM-ail7tVp3UVCAEONfIO0BnC9_F6sAAjIbAALpeBhShPjGWqux7wQeBA",
-    "CAACAgQAAxkBAANAail7t6BDeUmR7_VAuUvRiVEO8QEAAtIdAALP3ZhRz6l8TY7EK-QeBA",
-    "CAACAgQAAxkBAANCail7uOMXXIyc-8LiMPpuid79wegAAuoRAAImR3BQe4NoAtilxMUeBA",
-    "CAACAgQAAxkBAANEail7uuThWyWL-kKPqAAC3GSoauMAAhYWAAIYexFT1RXZqaqBOsMeBA",
-    "CAACAgQAAxkBAANGail7v1k1_EFd6aOyGV_fh9wdnTkAAh0VAALVIihTuWparDU7dnceBA",
-    "CAACAgQAAxkBAANIail7xcfNZe_-GIgpGhWUEsxHZcYAAk0UAALQBgABU7vo8pNFFc8OHgQ",
-    "CAACAgUAAxkBAANKail76V9bDP577BmyVWhuDxN3K-EAAp8TAAKQlulXo4PLxIKpqSceBA",
-    "CAACAgUAAxkBAANMail76kGZZz2KlH7N32zlzg8XyyEAAhgSAAKYzehXXgs42Su-oLceBA",
-    "CAACAgUAAxkBAANOail7646aSehFDdkS3-DA6uNXOt4AAnoVAAK-5OlXnDljvB-x2jkeBA",
-    "CAACAgUAAxkBAANQail761sSgH1lIDAw0gplPodagT8AAmETAAI_IuhXruhPpRhDlI4eBA",
-    "CAACAgUAAxkBAANSail77dFeBhzR0O_V42UvDq5IZdEAAlgRAAKAzelXnHKbu_Qdl1UeBA",
-    "CAACAgUAAxkBAANUail77ihu7l6_L-liXDSUO0-cxpEAAkYXAAKEA-hXI05rQU313IEeBA",
-    "CAACAgUAAxkBAANWail78SwT04iaNhWp9U_1drJ6YrkAAgwVAAKkiQFUl5GASU-h2FweBA",
-    "CAACAgUAAxkBAANYail78WO0kXpEau6zFKHrTuqXgKQAAgcRAAKhVPlXvLBiKaxnDiAeBA",
-    "CAACAgUAAxkBAANaail78no8kyjowMYny7zuVOl93EIAAj8SAAJ0ifFXRDBduvA5FW4eBA",
-    "CAACAgUAAxkBAANcail783pbhfJhtZTYvRZm1gXG5RQAAiwSAAJ5H_lXHIyIyE1OgYoeBA",
-    "CAACAgUAAxkBAANeail79w8zAdHG_8YPurZwk61FqqEAAsMaAAJdJQFUiNgX1groxOkeBA",
-    "CAACAgUAAxkBAANgail794QBlEYHNVhuMW4f1oqvdsgAAi4TAAKRnvhXHtdjvR6AHH4eBA",
-    "CAACAgUAAxkBAANiail7-GQK1FadHHnQztxsfOY_qsoAAosTAALP6QABVOCRqV1xgOFtHgQ",
-    "CAACAgUAAxkBAANkail7-McyKPcw8OEzpFSUNM0WQo0AAiwSAAJ5H_lXHIyIyE1OgYoeBA",
-    "CAACAgUAAxkBAANlail7-F8Ol8THSrODg_ItU5jHXucAApESAAIKrAFUQAABOpLHISMrHgQ",
-    "CAACAgUAAxkBAANoail7-8XEhfhX7euJrBYU4-_ksZEAAk8UAAItcwABVJBjdyuq_9h2HgQ",
-    "CAACAgUAAxkBAANpail7-22Rim0XZZ3-BbPCT4Yv21EAAtoSAALTI_hXKhRrcezWL7seBA",
-    "CAACAgUAAxkBAANuail7_EA0HBi2ohwNM8Y7J2pjwhgAAkUTAAI2IfhXxwmUebW7ddseBA",
-    "CAACAgUAAxkBAANwail7_MZJV52BWqAzQgf3XhCW1OcAAqMRAALmPPhXsYikvAmaVbAeBA",
-    "CAACAgUAAxkBAANyail8E6r27hvKtJnk0bRrsLEbLDUAAkMUAAKnuzBW4o_27asInE0eBA",
-    "CAACAgUAAxkBAAN0ail8FNnx0WiTtgzlfh4-bWNP2D0AAnQSAAJrAeBVHig_EkL5RhkeBA",
-    "CAACAgUAAxkBAAN2ail8Fk39S0capghoPKyHCvQEkZoAAp0fAALAt4FX5uzHYk3LMFEeBA",
-    "CAACAgUAAxkBAAN4ail8GMH0LDtCfBmzO3lOmfZeJ4IAAt0aAAIDoflXLrTQilwOknYeBA",
-    "CAACAgUAAxkBAAN6ail8KEUEUCRGuoMz2qmjIIsVYLMAAxUAAvSAyVUQUJcUBdRt1x4E",
-    "CAACAgUAAxkBAAN8ail8KVX5COMKfX0rXbZYxY3G0wMAAr0YAAICgchVDuZMHaNfrsYeBA",
-    "CAACAgUAAxkBAAN-ail8LAt2lrgwnDhN-OSAsF7WkSgAArMVAAJf2MlVbJAGFCf0agQeBA",
-    "CAACAgUAAxkBAAOAail8MfYECAV2kvTMmIQeZ_pFIAAkMWAAIIG8hVDYEGCypgBigeBA",
-    "CAACAgUAAxkBAAOCail8M97GSBr2YC_ScaLNrsXNLx4AArMWAAK5MvBXOHRY-wx9LWoeBA",
-]
-
-FORCE_SUB_STICKERS = list(dict.fromkeys(_FORCE_SUB_STICKERS_RAW))
-MORNING_STICKER = FORCE_SUB_STICKERS[0]
+def _parse_fsub_args(raw: str):
+    channels = []
+    errors = []
+    pairs = re.split(r'\s{2,}|\n', raw.strip())
+    for pair in pairs:
+        pair = pair.strip()
+        if not pair:
+            continue
+        if "|" not in pair:
+            errors.append(f"❌ `{pair}` — format wrong. Use: LABEL | @channel")
+            continue
+        label, username = pair.split("|", 1)
+        label = label.strip()
+        username = username.strip()
+        if not label:
+            errors.append(f"❌ Label empty in: `{pair}`")
+            continue
+        if not (username.startswith("@") or username.lstrip("-").isdigit()):
+            errors.append(f"❌ `{username}` — must be @username or numeric ID")
+            continue
+        channels.append({"label": label, "username": username})
+    return channels, errors
 
 
-# ── Helpers ──────────────────────────────────────────────────
-
-async def _is_admin(client: Client, chat_id: int, user_id: int) -> bool:
-    try:
-        member = await client.get_chat_member(chat_id, user_id)
-        return member.status in (ChatMemberStatus.ADMINISTRATOR, ChatMemberStatus.OWNER)
-    except Exception:
-        return False
-
-
-def _parse_channel_arg(arg: str) -> str:
-    """
-    Accept @username, username (adds @), or numeric ID like -1001234567890.
-    Returns clean identifier for Pyrogram.
-    """
-    arg = arg.strip()
-    if arg.lstrip("-").isdigit():
-        return int(arg)  # numeric ID
-    if not arg.startswith("@"):
-        return "@" + arg
-    return arg
-
-
-async def _get_join_url(client: Client, channel) -> str | None:
-    """Get a joinable URL for a channel or group."""
-    try:
-        if isinstance(channel, str) and channel.startswith("@"):
-            return f"https://t.me/{channel.lstrip('@')}"
-        chat = await client.get_chat(channel)
-        if chat.username:
-            return f"https://t.me/{chat.username}"
-        # Private channel/group — generate invite link
-        invite = await client.export_chat_invite_link(chat.id)
-        return invite
-    except Exception as e:
-        logger.warning("Could not get join URL for %s: %s", channel, e)
-        return None
-
-
-async def _is_subscribed(client: Client, channel, user_id: int) -> bool:
-    """Check if user is member of a channel or group."""
+async def _user_subscribed(client, user_id: int, channel: str) -> bool:
     try:
         member = await client.get_chat_member(channel, user_id)
-        return member.status not in (
-            ChatMemberStatus.BANNED,
-            ChatMemberStatus.LEFT,
-        )
+        return member.status not in (ChatMemberStatus.BANNED, ChatMemberStatus.LEFT)
     except UserNotParticipant:
         return False
-    except (PeerIdInvalid, ChatAdminRequired):
-        return False
+    except (ChatAdminRequired, ChannelPrivate) as e:
+        logger.warning("Cannot check %s membership: %s", channel, e)
+        return True
     except Exception as e:
-        logger.warning("Force sub check error for %s: %s", channel, e)
-        return True  # Don't block if check fails
+        logger.warning("Membership check error %s / %s: %s", channel, user_id, e)
+        return True
 
 
-async def _check_all_subscribed(client: Client, channels: list, user_id: int):
-    """
-    Returns list of channels the user has NOT joined yet.
-    """
-    not_joined = []
+async def _get_unjoined(client, user_id: int, channels: list) -> list:
+    result = []
     for ch in channels:
-        joined = await _is_subscribed(client, ch, user_id)
-        if not joined:
-            not_joined.append(ch)
-    return not_joined
+        if not await _user_subscribed(client, user_id, ch["username"]):
+            result.append(ch)
+    return result
 
 
-async def _build_join_buttons(client: Client, channels: list) -> list:
-    """Build InlineKeyboardButton list for all unjoin channels."""
-    buttons = []
-    for i, ch in enumerate(channels, 1):
-        url = await _get_join_url(client, ch)
-        label = f"ᴊᴏɪɴ {i} 📢"
-        try:
-            chat = await client.get_chat(ch)
-            label = f"ᴊᴏɪɴ : {chat.title} 📢"
-        except Exception:
-            pass
-        if url:
-            buttons.append([InlineKeyboardButton(label, url=url)])
-    return buttons
+def _channel_url(username: str) -> str:
+    if username.startswith("@"):
+        return f"https://t.me/{username.lstrip('@')}"
+    clean = str(username).lstrip("-")
+    if clean.startswith("100"):
+        clean = clean[3:]
+    return f"https://t.me/c/{clean}"
 
 
-def _pick_force_sub_sticker(chat_id: int, user_id: int) -> str | None:
-    """Return a stable-but-rotating sticker. Morning always uses the first sticker."""
-    if not FORCE_SUB_STICKERS:
-        return None
-    now = datetime.now(IST)
-    if 5 <= now.hour < 12:
-        return MORNING_STICKER
-    seed = f"{chat_id}:{user_id}:{now.strftime('%Y-%m-%d')}:{now.hour // 3}"
-    idx = int(hashlib.sha256(seed.encode()).hexdigest(), 16) % len(FORCE_SUB_STICKERS)
-    return FORCE_SUB_STICKERS[idx]
+def _join_keyboard(channels: list, chat_id: int, user_id: int) -> InlineKeyboardMarkup:
+    rows = []
+    for ch in channels:
+        rows.append([InlineKeyboardButton(
+            f"📢 {ch['label']}",
+            url=_channel_url(ch["username"])
+        )])
+    rows.append([InlineKeyboardButton(
+        "✅ I've Joined",
+        callback_data=f"fsub_verify:{chat_id}:{user_id}"
+    )])
+    return InlineKeyboardMarkup(rows)
 
 
-async def _send_force_sub_sticker(
-    client: Client,
-    chat_id: int,
-    user_id: int,
-    *,
-    reply_to_message_id: int | None = None,
-):
-    sticker_id = _pick_force_sub_sticker(chat_id, user_id)
-    if not sticker_id:
-        return None
+def _welcome_keyboard(channels: list) -> InlineKeyboardMarkup:
+    rows = []
+    for ch in channels:
+        rows.append([InlineKeyboardButton(
+            f"📢 {ch['label']}",
+            url=_channel_url(ch["username"])
+        )])
+    return InlineKeyboardMarkup(rows)
+
+
+def _format_text(template: str, user, chat_title: str) -> str:
     try:
-        sticker = await client.send_sticker(
-            chat_id,
-            sticker_id,
-            reply_to_message_id=reply_to_message_id,
+        return template.format(
+            mention=user.mention,
+            first_name=user.first_name or "",
+            last_name=user.last_name or "",
+            username=user.username or user.first_name or "",
+            id=user.id,
+            title=chat_title or "",
         )
-        asyncio.create_task(_auto_delete(sticker, STICKER_DELETE_SECONDS))
-        return sticker
-    except Exception as e:
-        logger.warning("Could not send force-sub sticker: %s", e)
-        return None
-
-
-async def _auto_delete(msg, delay=30):
-    await asyncio.sleep(delay)
-    try:
-        await msg.delete()
     except Exception:
-        pass
+        return template
 
 
-async def _mute_user_temporarily(client: Client, chat_id: int, user_id: int, seconds: int = MUTE_SECONDS):
-    """Restrict a user from sending messages for `seconds` seconds."""
-    until = datetime.now(IST) + timedelta(seconds=seconds)
-    try:
-        await client.restrict_chat_member(
-            chat_id,
-            user_id,
-            ChatPermissions(can_send_messages=False),
-            until_date=until,
-        )
-    except (ChatAdminRequired, UserAdminInvalid) as e:
-        logger.warning("Could not mute user %s in %s: %s", user_id, chat_id, e)
-    except Exception as e:
-        logger.warning("Force-sub mute failed for %s in %s: %s", user_id, chat_id, e)
+# ── Registration ──────────────────────────────────────────────
 
+def register_force_sub_plugin(app):
 
-async def _send_force_sub_notice(client: Client, message: Message, user, not_joined: list, *, is_join_event: bool = False):
-    """
-    Force-sub anti-spam flow:
-    1) First blocked message -> send join request (force) message.
-    2) Same user sends again within 30s -> bot sends one sticker as reply.
-    3) Same user sends again (sticker also ignored) -> user is muted
-       (can_send_messages disabled) for 30 seconds.
-    4) Force message auto-deletes after 30s, sticker auto-deletes after 10s.
-    5) After the cycle expires (~30s), the user's next blocked message
-       gets a fresh force message again.
-    """
-    chat_id = message.chat.id
-    user_id = user.id
-    state_key = (chat_id, user_id)
-    now_ts = datetime.now(IST).timestamp()
-
-    state = _FORCE_NOTICE_STATE.get(state_key)
-    if state and now_ts < state.get("expires_at", 0):
-        stage = state.get("stage", 0)
-
-        if stage == 0:
-            # Second blocked attempt -> send a sticker as a nudge
-            await _send_force_sub_sticker(
-                client,
-                chat_id,
-                user_id,
-                reply_to_message_id=state.get("message_id"),
-            )
-            state["stage"] = 1
-
-        elif stage == 1:
-            # Third+ attempt -> user ignored notice + sticker, mute briefly
-            await _mute_user_temporarily(client, chat_id, user_id, MUTE_SECONDS)
-            state["stage"] = 2
-
-        # stage == 2 -> already muted, nothing further to do
-        return
-
-    buttons = await _build_join_buttons(client, not_joined)
-    keyboard = InlineKeyboardMarkup(buttons) if buttons else None
-
-    mention = f'<a href="tg://user?id={user.id}">{user.first_name}</a>'
-    count = len(not_joined)
-    join_text = "ʀᴇǫᴜɪʀᴇᴅ ᴄʜᴀɴɴᴇʟ" if count == 1 else f"ᴀʟʟ {count} ʀᴇǫᴜɪʀᴇᴅ ᴄʜᴀɴɴᴇʟs/ɢʀᴏᴜᴘs"
-    heading = "ᴡᴇʟᴄᴏᴍᴇ" if is_join_event else "ʜᴇʏ"
-
-    custom_template = await get_force_sub_message(chat_id)
-    if custom_template:
-        first_name = user.first_name or ""
-        username = f"@{user.username}" if user.username else user.first_name or ""
-        text = (
-            custom_template
-            .replace("{mention}", mention)
-            .replace("{first_name}", first_name)
-            .replace("{username}", username)
-            .replace("{title}", message.chat.title or "")
-            .replace("{count}", str(count))
-            .replace("{channels}", join_text)
-        )
-    else:
-        text = (
-            f"{BORDER}\n"
-            "ғᴏʀᴄᴇ • sᴜʙsᴄʀɪʙᴇ\n"
-            f"{BORDER}\n\n"
-            f"{heading} {mention}\n\n"
-            f"ᴘʟᴇᴀsᴇ ᴊᴏɪɴ {join_text}\n"
-            "ᴛᴏ sᴇɴᴅ ᴍᴇssᴀɢᴇs ɪɴ ᴛʜɪs ɢʀᴏᴜᴘ.\n\n"
-            "ᴜɴᴛɪʟ ʏᴏᴜ ᴊᴏɪɴ,\n"
-            "ʏᴏᴜʀ ᴍᴇssᴀɢᴇs ᴡɪʟʟ ʙᴇ ᴅᴇʟᴇᴛᴇᴅ.\n\n"
-            "ɴᴏᴛᴇ : ᴍᴇssᴀɢᴇ 30 sᴇᴄᴏɴᴅs ᴍᴇ ᴅᴇʟᴇᴛᴇ ʜᴏ ᴊᴀʏᴇɢᴀ.\n"
-            "ᴅᴜʙᴀʀᴀ ᴛʀʏ ᴋᴀʀɴᴇ ᴘᴀʀ sᴛɪᴄᴋᴇʀ ᴀᴀʏᴇɢᴀ.\n\n"
-            f"{BORDER}"
-        )
-
-    warning = await client.send_message(
-        chat_id,
-        text,
-        reply_markup=keyboard,
-        parse_mode=enums.ParseMode.HTML,
-    )
-
-    _FORCE_NOTICE_STATE[state_key] = {
-        "message_id": warning.id,
-        "expires_at": now_ts + NOTICE_DELETE_SECONDS,
-        "stage": 0,
-    }
-    await mark_force_sub_notice(chat_id, user_id)
-    asyncio.create_task(_auto_delete(warning, NOTICE_DELETE_SECONDS))
-
-    async def _clear_state_later():
-        await asyncio.sleep(NOTICE_DELETE_SECONDS)
-        current = _FORCE_NOTICE_STATE.get(state_key)
-        if current and current.get("message_id") == warning.id:
-            _FORCE_NOTICE_STATE.pop(state_key, None)
-
-    asyncio.create_task(_clear_state_later())
-
-
-# ── Registration ─────────────────────────────────────────────
-
-def register_force_sub(app: Client):
-
-    # ── /addfsub @channel or -100ID ───────────────────────────
-    @app.on_message(filters.command("addfsub") & filters.group)
-    async def cmd_addfsub(client: Client, message: Message):
-        if not message.from_user:
-            return
-        if not await group_is_approved(message.chat.id):
-            return await message.reply_text("⏳ Group pending approval.")
-        if not await _is_admin(client, message.chat.id, message.from_user.id):
-            return await message.reply_text("❌ Admins only.")
-
-        if len(message.command) < 2:
-            return await message.reply_text(
-                f"{BORDER}\n"
-                "ғᴏʀᴄᴇ • sᴜʙsᴄʀɪʙᴇ\n"
-                f"{BORDER}\n\n"
-                "ᴜsᴀɢᴇ :\n"
-                "/addfsub @channel\n"
-                "/addfsub -1001234567890\n\n"
-                "ʙᴏᴛ ᴍᴜsᴛ ʙᴇ ᴀᴅᴍɪɴ\n"
-                "ɪɴ ᴛʜᴀᴛ ᴄʜᴀɴɴᴇʟ/ɢʀᴏᴜᴘ.\n\n"
-                f"{BORDER}"
-            )
-
-        channel = _parse_channel_arg(message.command[1])
-
-        # Verify bot can access the channel/group
-        try:
-            chat = await client.get_chat(channel)
-            channel_name = chat.title or str(channel)
-            # Store as string for DB
-            channel_str = f"@{chat.username}" if chat.username else str(chat.id)
-        except Exception:
-            return await message.reply_text(
-                "❌ Cannot access that channel/group.\n"
-                "Make sure bot is admin there."
-            )
-
-        await add_force_sub_channel(message.chat.id, channel_str)
-        await enable_force_sub(message.chat.id)  # Auto-enable force-sub
-        await message.reply_text(
-            f"{BORDER}\n"
-            "ғᴏʀᴄᴇ • sᴜʙsᴄʀɪʙᴇ\n"
-            f"{BORDER}\n\n"
-            "✅ ᴀᴅᴅᴇᴅ :\n"
-            f"  {channel_name}\n\n"
-            "ғᴏʀᴄᴇ sᴜʙ ɪs ɴᴏᴡ ᴀᴄᴛɪᴠᴇ ✅\n"
-            "ᴜsᴇʀs ᴍᴜsᴛ ɴᴏᴡ ᴊᴏɪɴ\n"
-            "ᴛʜɪs ᴄʜᴀɴɴᴇʟ ᴛᴏ ᴄʜᴀᴛ.\n\n"
-            f"{BORDER}"
-        )
-
-    # ── /rmfsub @channel or -100ID ────────────────────────────
-    @app.on_message(filters.command("rmfsub") & filters.group)
-    async def cmd_rmfsub(client: Client, message: Message):
-        if not message.from_user:
-            return
+    # ── /setfsub ─────────────────────────────────────────────
+    @app.on_message(filters.group & filters.command("setfsub"))
+    async def cmd_setfsub(client, message: Message):
         if not await group_is_approved(message.chat.id):
             return
-        if not await _is_admin(client, message.chat.id, message.from_user.id):
+        member = await client.get_chat_member(message.chat.id, message.from_user.id)
+        if not (member.privileges and member.privileges.can_manage_chat):
             return await message.reply_text("❌ Admins only.")
 
-        if len(message.command) < 2:
-            return await message.reply_text(
-                "ᴜsᴀɢᴇ : /rmfsub @channel\n"
-                "ᴏʀ     /rmfsub -1001234567890"
-            )
-
-        channel = _parse_channel_arg(message.command[1])
-
-        try:
-            chat = await client.get_chat(channel)
-            channel_str = f"@{chat.username}" if chat.username else str(chat.id)
-            channel_name = chat.title or channel_str
-        except Exception:
-            channel_str = str(channel)
-            channel_name = channel_str
-
-        await remove_force_sub_channel(message.chat.id, channel_str)
-        await message.reply_text(
-            f"{BORDER}\n"
-            "ғᴏʀᴄᴇ • sᴜʙsᴄʀɪʙᴇ\n"
-            f"{BORDER}\n\n"
-            "🗑 ʀᴇᴍᴏᴠᴇᴅ :\n"
-            f"  {channel_name}\n\n"
-            f"{BORDER}"
-        )
-
-    # ── /fsub on | off ────────────────────────────────────────
-    @app.on_message(filters.command("fsub") & filters.group)
-    async def cmd_fsub(client: Client, message: Message):
-        if not message.from_user:
-            return
-        if not await group_is_approved(message.chat.id):
-            return
-        if not await _is_admin(client, message.chat.id, message.from_user.id):
-            return await message.reply_text("❌ Admins only.")
-
-        arg = message.command[1].lower() if len(message.command) > 1 else ""
-
-        if arg == "off":
-            await disable_force_sub(message.chat.id)
-            return await message.reply_text(
-                f"{BORDER}\n"
-                "ғᴏʀᴄᴇ • sᴜʙsᴄʀɪʙᴇ\n"
-                f"{BORDER}\n\n"
-                "sᴛᴀᴛᴜs : ᴅɪsᴀʙʟᴇᴅ 🔴\n\n"
-                "ᴜsᴇʀs ᴄᴀɴ ɴᴏᴡ ᴄʜᴀᴛ\n"
-                "ᴡɪᴛʜᴏᴜᴛ ᴊᴏɪɴɪɴɢ.\n\n"
-                f"{BORDER}"
-            )
-
-        if arg == "on":
-            await enable_force_sub(message.chat.id)
-            return await message.reply_text(
-                f"{BORDER}\n"
-                "ғᴏʀᴄᴇ • sᴜʙsᴄʀɪʙᴇ\n"
-                f"{BORDER}\n\n"
-                "sᴛᴀᴛᴜs : ᴀᴄᴛɪᴠᴇ ✅\n\n"
-                "ᴜsᴇʀs ᴍᴜsᴛ ɴᴏᴡ ᴊᴏɪɴ\n"
-                "ʙᴇꜰᴏʀᴇ ᴄʜᴀᴛᴛɪɴɢ.\n\n"
-                f"{BORDER}"
-            )
-
-        # Show status
-        cfg = await get_force_sub(message.chat.id)
-        status = "ᴀᴄᴛɪᴠᴇ ✅" if cfg["enabled"] else "ɪɴᴀᴄᴛɪᴠᴇ 🔴"
-        channels = cfg["channels"]
-        ch_list = "\n".join(f"  • {c}" for c in channels) if channels else "  ɴᴏɴᴇ sᴇᴛ"
-
-        await message.reply_text(
-            f"{BORDER}\n"
-            "ғᴏʀᴄᴇ • sᴜʙsᴄʀɪʙᴇ\n"
-            f"{BORDER}\n\n"
-            f"sᴛᴀᴛᴜs : {status}\n\n"
-            f"ᴄʜᴀɴɴᴇʟs :\n{ch_list}\n\n"
-            "ᴄᴏᴍᴍᴀɴᴅs :\n"
-            "/addfsub @channel\n"
-            "/rmfsub @channel\n"
-            "/fsub on | off\n"
-            "/fsublist\n"
-            "/setfsubmsg <text>\n"
-            "/resetfsubmsg\n\n"
-            f"{BORDER}"
-        )
-
-    # ── /setfsubmsg <text> ────────────────────────────────────
-    # Customize the force-sub message shown to non-subscribers.
-    # This is a separate command from /setwelcome, so the welcome
-    # message and the force-sub message can be configured independently.
-    @app.on_message(filters.command("setfsubmsg") & filters.group)
-    async def cmd_setfsubmsg(client: Client, message: Message):
-        if not message.from_user:
-            return
-        if not await group_is_approved(message.chat.id):
-            return
-        if not await _is_admin(client, message.chat.id, message.from_user.id):
-            return await message.reply_text("❌ Admins only.")
-
-        text_input = message.text or message.caption or ""
-        parts = text_input.split(maxsplit=1)
+        parts = message.text.split(None, 1)
         if len(parts) < 2:
             return await message.reply_text(
-                f"{BORDER}\n"
-                "ғᴏʀᴄᴇ • sᴜʙsᴄʀɪʙᴇ\n"
-                f"{BORDER}\n\n"
-                "ᴜsᴀɢᴇ :\n"
-                "/setfsubmsg &lt;message&gt;\n\n"
-                "ᴘʟᴀᴄᴇʜᴏʟᴅᴇʀs :\n"
-                "{mention} — ᴜsᴇʀ ᴍᴇɴᴛɪᴏɴ\n"
-                "{first_name} — ғɪʀsᴛ ɴᴀᴍᴇ\n"
-                "{username} — @ᴜsᴇʀɴᴀᴍᴇ\n"
-                "{title} — ɢʀᴏᴜᴘ ɴᴀᴍᴇ\n"
-                "{count} — ᴄʜᴀɴɴᴇʟs ʟᴇғᴛ\n"
-                "{channels} — ʀᴇǫᴜɪʀᴇᴅ ᴄʜᴀɴɴᴇʟ ᴛᴇxᴛ\n\n"
-                "ᴜsᴇ /delfsubmsg ᴛᴏ ʀᴇsᴇᴛ.\n\n"
-                f"{BORDER}"
+                "**Usage:**\n"
+                "`/setfsub LABEL | @channel`\n\n"
+                "**Multiple channels:**\n"
+                "`/setfsub DISCUSS | @channel1  UPDATE | @channel2`\n\n"
+                "_(Separate pairs with 2+ spaces or newlines)_"
             )
 
-        await set_force_sub_message(message.chat.id, parts[1])
-        preview = parts[1][:60] + ("..." if len(parts[1]) > 60 else "")
-        await message.reply_text(
-            f"{BORDER}\n"
-            "ғᴏʀᴄᴇ • sᴜʙsᴄʀɪʙᴇ\n"
-            f"{BORDER}\n\n"
-            "✅ FORCE-SUB NOTICE MESSAGE SAVED!\n\n"
-            "━━━━━━━━━━━━━━━━━━━━\n"
-            f"{preview}\n\n"
-            f"{BORDER}"
-        )
+        channels, errors = _parse_fsub_args(parts[1])
+        if not channels:
+            msg = "⚠️ No valid entries.\n\nFormat: `LABEL | @username`"
+            if errors:
+                msg += "\n\nErrors:\n" + "\n".join(errors)
+            return await message.reply_text(msg)
 
-    # ── /resetfsubmsg ─────────────────────────────────────────
-    @app.on_message(filters.command("resetfsubmsg") & filters.group)
-    async def cmd_resetfsubmsg(client: Client, message: Message):
-        if not message.from_user:
-            return
+        await db.set_fsub_channels(message.chat.id, channels)
+
+        lines = ["**ADDED:**"]
+        for ch in channels:
+            lines.append(f"✅ {ch['label']} → {ch['username']}")
+        reply = "\n".join(lines)
+        if errors:
+            reply += "\n\n⚠️ Skipped:\n" + "\n".join(errors)
+        await message.reply_text(reply, disable_web_page_preview=True)
+
+    # ── /clearfsub ───────────────────────────────────────────
+    @app.on_message(filters.group & filters.command("clearfsub"))
+    async def cmd_clearfsub(client, message: Message):
         if not await group_is_approved(message.chat.id):
             return
-        if not await _is_admin(client, message.chat.id, message.from_user.id):
+        member = await client.get_chat_member(message.chat.id, message.from_user.id)
+        if not (member.privileges and member.privileges.can_manage_chat):
             return await message.reply_text("❌ Admins only.")
 
-        await set_force_sub_message(message.chat.id, None)
-        await message.reply_text("✅ Force-sub message reset to default.")
+        await db.clear_fsub_channels(message.chat.id)
+        await message.reply_text("🗑️ **ALL FORCE-SUB CHANNELS CLEARED.**")
 
-    # ── /fsublist ─────────────────────────────────────────────
-    @app.on_message(filters.command("fsublist") & filters.group)
-    async def cmd_fsublist(client: Client, message: Message):
-        if not message.from_user:
+    # ── /setfsubmsg ──────────────────────────────────────────
+    @app.on_message(filters.group & filters.command("setfsubmsg"))
+    async def cmd_setfsubmsg(client, message: Message):
+        if not await group_is_approved(message.chat.id):
             return
-        if not await _is_admin(client, message.chat.id, message.from_user.id):
+        member = await client.get_chat_member(message.chat.id, message.from_user.id)
+        if not (member.privileges and member.privileges.can_manage_chat):
             return await message.reply_text("❌ Admins only.")
 
-        cfg = await get_force_sub(message.chat.id)
-        channels = cfg["channels"]
-        status = "ᴀᴄᴛɪᴠᴇ ✅" if cfg["enabled"] else "ɪɴᴀᴄᴛɪᴠᴇ 🔴"
+        parts = message.text.split(None, 1)
+        if len(parts) < 2:
+            return await message.reply_text(
+                "**Usage:**\n"
+                "`/setfsubmsg Hey {mention} 👋\\n\\nWelcome!`\n\n"
+                "**Placeholders:** `{mention}` `{first_name}` `{username}` `{title}`"
+            )
+
+        await db.set_fsub_message(message.chat.id, parts[1])
+        preview = parts[1][:300] + ("…" if len(parts[1]) > 300 else "")
+        await message.reply_text(
+            f"✅ **FORCE-SUB NOTICE MESSAGE SAVED!**\n\n"
+            f"{'─' * 16}\n\n{preview}"
+        )
+
+    # ── /delfsubmsg ──────────────────────────────────────────
+    @app.on_message(filters.group & filters.command("delfsubmsg"))
+    async def cmd_delfsubmsg(client, message: Message):
+        if not await group_is_approved(message.chat.id):
+            return
+        member = await client.get_chat_member(message.chat.id, message.from_user.id)
+        if not (member.privileges and member.privileges.can_manage_chat):
+            return await message.reply_text("❌ Admins only.")
+
+        await db.clear_fsub_message(message.chat.id)
+        await message.reply_text("🗑️ Force-sub notice message cleared. Default will be used.")
+
+    # ── /viewfsub ────────────────────────────────────────────
+    @app.on_message(filters.group & filters.command("viewfsub"))
+    async def cmd_viewfsub(client, message: Message):
+        if not await group_is_approved(message.chat.id):
+            return
+        member = await client.get_chat_member(message.chat.id, message.from_user.id)
+        if not (member.privileges and member.privileges.can_manage_chat):
+            return await message.reply_text("❌ Admins only.")
+
+        channels = await db.get_fsub_channels(message.chat.id)
+        fsub_msg = await db.get_fsub_message(message.chat.id)
 
         if not channels:
             return await message.reply_text(
-                f"{BORDER}\n"
-                "ғᴏʀᴄᴇ • sᴜʙsᴄʀɪʙᴇ\n"
-                f"{BORDER}\n\n"
-                "ɴᴏ ᴄʜᴀɴɴᴇʟs sᴇᴛ.\n"
-                "ᴜsᴇ /addfsub ᴛᴏ ᴀᴅᴅ.\n\n"
-                f"{BORDER}"
+                "ℹ️ No force-sub channels set.\n"
+                "Use `/setfsub LABEL | @channel` to add one."
             )
 
-        lines = []
+        lines = ["**Current Force-Sub Channels:**\n"]
         for i, ch in enumerate(channels, 1):
-            try:
-                chat = await client.get_chat(ch)
-                lines.append(f"  {i}. {chat.title} ({ch})")
-            except Exception:
-                lines.append(f"  {i}. {ch}")
+            lines.append(f"{i}. **{ch['label']}** → `{ch['username']}`")
 
-        ch_text = "\n".join(lines)
-        await message.reply_text(
-            f"{BORDER}\n"
-            "ғᴏʀᴄᴇ • sᴜʙsᴄʀɪʙᴇ ʟɪsᴛ\n"
-            f"{BORDER}\n\n"
-            f"sᴛᴀᴛᴜs : {status}\n\n"
-            f"ᴄʜᴀɴɴᴇʟs ({len(channels)}) :\n"
-            f"{ch_text}\n\n"
-            f"{BORDER}"
-        )
+        if fsub_msg:
+            lines.append(f"\n**Notice Message:**\n{fsub_msg[:200]}{'…' if len(fsub_msg) > 200 else ''}")
+        else:
+            lines.append("\n_No custom notice message. Default will be used._")
 
+        await message.reply_text("\n".join(lines), disable_web_page_preview=True)
 
-    # ── /setfsub LABEL | @channel (Image-2 style) ─────────────────────────────
-    @app.on_message(filters.command("setfsub") & filters.group)
-    async def cmd_setfsub(client: Client, message: Message):
-        import re as _re
-        if not message.from_user:
-            return
-        if not await group_is_approved(message.chat.id):
-            return await message.reply_text("⏳ Group pending approval.")
-        if not await _is_admin(client, message.chat.id, message.from_user.id):
-            return await message.reply_text("❌ Admins only.")
-
-        text_input = message.text or message.caption or ""
-        parts = text_input.split(maxsplit=1)
-        if len(parts) < 2:
-            return await message.reply_text(
-                f"{BORDER}\n"
-                "ғᴏʀᴄᴇ • sᴜʙsᴄʀɪʙᴇ\n"
-                f"{BORDER}\n\n"
-                "ᴜsᴀɢᴇ :\n"
-                "/setfsub LABEL | @channel\n"
-                "/setfsub DISCUSS | @discuss  UPDATE | @update\n\n"
-                "ᴍᴜʟᴛɪᴘʟᴇ ᴄʜᴀɴɴᴇʟs — sᴇᴘᴀʀᴀᴛᴇ ᴡɪᴛʜ 2+ sᴘᴀᴄᴇs ᴏʀ ɴᴇᴡʟɪɴᴇ\n\n"
-                f"{BORDER}"
-            )
-
-        raw = parts[1]
-        pairs = _re.split(r"  +|\n", raw.strip())
-        pairs = [p.strip() for p in pairs if p.strip()]
-
-        added = []
-        failed = []
-
-        for pair in pairs:
-            if "|" not in pair:
-                failed.append(f"❌ {pair} (missing |)")
-                continue
-            label_part, ch_part = pair.split("|", 1)
-            label = label_part.strip()
-            ch_raw = ch_part.strip()
-            if not label or not ch_raw:
-                failed.append(f"❌ {pair} (empty label or channel)")
-                continue
-            channel = _parse_channel_arg(ch_raw)
-            try:
-                chat = await client.get_chat(channel)
-                channel_str = f"@{chat.username}" if chat.username else str(chat.id)
-                await set_force_sub_channel_label(message.chat.id, label, channel_str)
-                added.append(f"✅ {label} → {channel_str}")
-            except Exception:
-                failed.append(f"❌ {label} | {ch_raw} (cannot access)")
-
-        if added:
-            await enable_force_sub(message.chat.id)
-
-        lines = "\n".join(added + failed)
-        status_line = "ғᴏʀᴄᴇ sᴜʙ ɪs ɴᴏᴡ ᴀᴄᴛɪᴠᴇ ✅" if added else "ɴᴏ ᴄʜᴀɴɴᴇʟs ᴀᴅᴅᴇᴅ ❌"
-        await message.reply_text(
-            f"{BORDER}\n"
-            "ғᴏʀᴄᴇ • sᴜʙsᴄʀɪʙᴇ\n"
-            f"{BORDER}\n\n"
-            "ADDED:\n"
-            f"{lines}\n\n"
-            f"{status_line}\n\n"
-            f"{BORDER}"
-        )
-
-    # ── /clearfsub ─────────────────────────────────────────────────────────────
-    @app.on_message(filters.command("clearfsub") & filters.group)
-    async def cmd_clearfsub(client: Client, message: Message):
-        if not message.from_user:
-            return
+    # ── New member join — mute if not subscribed ──────────────
+    @app.on_message(filters.group & filters.new_chat_members, group=1)
+    async def fsub_new_member(client, message: Message):
         if not await group_is_approved(message.chat.id):
             return
-        if not await _is_admin(client, message.chat.id, message.from_user.id):
-            return await message.reply_text("❌ Admins only.")
-        await clear_all_force_sub_channels(message.chat.id)
-        await message.reply_text(
-            f"{BORDER}\n"
-            "ғᴏʀᴄᴇ • sᴜʙsᴄʀɪʙᴇ\n"
-            f"{BORDER}\n\n"
-            "🗑 ᴀʟʟ ᴄʜᴀɴɴᴇʟs ʀᴇᴍᴏᴠᴇᴅ.\n"
-            "ғᴏʀᴄᴇ sᴜʙ ᴅɪsᴀʙʟᴇᴅ 🔴\n\n"
-            f"{BORDER}"
-        )
 
-    # ── /viewfsub ──────────────────────────────────────────────────────────────
-    @app.on_message(filters.command("viewfsub") & filters.group)
-    async def cmd_viewfsub(client: Client, message: Message):
-        if not message.from_user:
-            return
-        if not await _is_admin(client, message.chat.id, message.from_user.id):
-            return await message.reply_text("❌ Admins only.")
-        cfg = await get_force_sub(message.chat.id)
-        channels = cfg["channels"]
-        status = "ᴀᴄᴛɪᴠᴇ ✅" if cfg["enabled"] else "ɪɴᴀᴄᴛɪᴠᴇ 🔴"
-        labels = await get_force_sub_labels(message.chat.id)
-        custom_msg = await get_force_sub_message(message.chat.id)
-
+        channels = await db.get_fsub_channels(message.chat.id)
         if not channels:
-            return await message.reply_text(
-                f"{BORDER}\n"
-                "ғᴏʀᴄᴇ • sᴜʙsᴄʀɪʙᴇ\n"
-                f"{BORDER}\n\n"
-                f"sᴛᴀᴛᴜs : {status}\n\n"
-                "ɴᴏ ᴄʜᴀɴɴᴇʟs sᴇᴛ.\n"
-                "ᴜsᴇ /setfsub ᴏʀ /addfsub ᴛᴏ ᴀᴅᴅ.\n\n"
-                f"{BORDER}"
-            )
+            return  # force-sub not configured
 
-        lines = []
-        for i, ch in enumerate(channels, 1):
-            key = ch.lstrip("@").replace("-", "_")
-            label = labels.get(key, "")
-            label_str = f" [{label}]" if label else ""
-            try:
-                chat_obj = await client.get_chat(ch)
-                lines.append(f"  {i}. {chat_obj.title}{label_str} ({ch})")
-            except Exception:
-                lines.append(f"  {i}. {ch}{label_str}")
+        me = await client.get_me()
+        fsub_text = await db.get_fsub_message(message.chat.id) or DEFAULT_FSUB_MSG
 
-        ch_text = "\n".join(lines)
-        msg_preview = (custom_msg[:80] + "...") if custom_msg and len(custom_msg) > 80 else (custom_msg or "ᴅᴇғᴀᴜʟᴛ")
-        await message.reply_text(
-            f"{BORDER}\n"
-            "ғᴏʀᴄᴇ • sᴜʙsᴄʀɪʙᴇ\n"
-            f"{BORDER}\n\n"
-            f"sᴛᴀᴛᴜs : {status}\n\n"
-            f"ᴄʜᴀɴɴᴇʟs ({len(channels)}) :\n"
-            f"{ch_text}\n\n"
-            f"ɴᴏᴛɪᴄᴇ ᴍsɢ : {msg_preview}\n\n"
-            f"{BORDER}"
-        )
-
-    # ── /delfsubmsg (alias for /resetfsubmsg) ─────────────────────────────────
-    @app.on_message(filters.command("delfsubmsg") & filters.group)
-    async def cmd_delfsubmsg(client: Client, message: Message):
-        if not message.from_user:
-            return
-        if not await group_is_approved(message.chat.id):
-            return
-        if not await _is_admin(client, message.chat.id, message.from_user.id):
-            return await message.reply_text("❌ Admins only.")
-        await set_force_sub_message(message.chat.id, None)
-        await message.reply_text(
-            f"{BORDER}\n"
-            "ғᴏʀᴄᴇ • sᴜʙsᴄʀɪʙᴇ\n"
-            f"{BORDER}\n\n"
-            "✅ ɴᴏᴛɪᴄᴇ ᴍᴇssᴀɢᴇ ʀᴇsᴇᴛ\n"
-            "ᴅᴇғᴀᴜʟᴛ ᴍᴇssᴀɢᴇ ʀᴇsᴛᴏʀᴇᴅ.\n\n"
-            f"{BORDER}"
-        )
-
-    # ── Message watcher — delete & warn non-subscribers ───────
-    @app.on_message(filters.group & ~filters.service, group=8)
-    async def force_sub_watcher(client: Client, message: Message):
-        if not message.from_user:
-            return
-
-        chat_id = message.chat.id
-        user_id = message.from_user.id
-
-        # Skip admins
-        if await _is_admin(client, chat_id, user_id):
-            return
-
-        cfg = await get_force_sub(chat_id)
-        if not cfg["enabled"] or not cfg["channels"]:
-            return
-
-        not_joined = await _check_all_subscribed(client, cfg["channels"], user_id)
-        if not not_joined:
-            await clear_force_sub_notice(chat_id, user_id)
-            return
-
-        # Delete user's message silently
-        try:
-            await message.delete()
-        except Exception:
-            pass
-
-        # Send join request only once per user until the user joins.
-        await _send_force_sub_notice(client, message, message.from_user, not_joined)
-
-    # ── New member join ────────────────────────────────────────
-    # NOTE: force-sub notice is intentionally NOT sent on join anymore.
-    # It is only shown when the user actually tries to send a message
-    # in the group (handled by force_sub_watcher above). This avoids
-    # the force-sub message/sticker showing up alongside the welcome
-    # message for new members.
-    #
-    # We DO reset any leftover notice/sticker/mute cycle state for the
-    # joining user, so that if they (re)join and leftover state from a
-    # previous cycle (e.g. quick leave+rejoin while testing) is still
-    # "active", their next message still starts fresh: force message
-    # first, sticker only if they ignore it and message again.
-    @app.on_message(filters.new_chat_members & filters.group, group=8)
-    async def new_member_reset_state(client: Client, message: Message):
         for user in message.new_chat_members:
-            _FORCE_NOTICE_STATE.pop((message.chat.id, user.id), None)
+            if user.id == me.id:
+                continue
+            if user.is_bot:
+                continue
+
+            unjoined = await _get_unjoined(client, user.id, channels)
+
+            if unjoined:
+                # MUTE the user until they join required channels
+                try:
+                    await client.restrict_chat_member(
+                        message.chat.id,
+                        user.id,
+                        MUTE_PERMISSIONS,
+                    )
+                except Exception as e:
+                    logger.warning("Could not mute user %s: %s", user.id, e)
+
+                notice = _format_text(fsub_text, user, message.chat.title)
+                keyboard = _join_keyboard(unjoined, message.chat.id, user.id)
+                try:
+                    await client.send_message(
+                        message.chat.id,
+                        notice,
+                        reply_markup=keyboard,
+                        disable_web_page_preview=True,
+                    )
+                except Exception as e:
+                    logger.error("Failed to send fsub notice: %s", e)
+
+            else:
+                # Already subscribed — show welcome with channel buttons
+                welcome_text = await db.get_welcome_message(message.chat.id)
+                if not welcome_text:
+                    welcome_text = fsub_text
+                text = _format_text(welcome_text, user, message.chat.title)
+                keyboard = _welcome_keyboard(channels)
+                try:
+                    await client.send_message(
+                        message.chat.id,
+                        text,
+                        reply_markup=keyboard,
+                        disable_web_page_preview=True,
+                    )
+                except Exception as e:
+                    logger.error("Failed to send fsub welcome: %s", e)
+
+        # Stop normal welcome from also firing when fsub is active
+        message.stop_propagation()
+
+    # ── Callback: "✅ I've Joined" ────────────────────────────
+    @app.on_callback_query(filters.regex(r"^fsub_verify:"))
+    async def fsub_verify(client, query: CallbackQuery):
+        parts = query.data.split(":")
+        if len(parts) != 3:
+            return await query.answer("Invalid request.", show_alert=True)
+
+        chat_id = int(parts[1])
+        target_user_id = int(parts[2])
+
+        # Only the target user can press this button
+        if query.from_user.id != target_user_id:
+            return await query.answer(
+                "❌ This button is not for you.", show_alert=True
+            )
+
+        channels = await db.get_fsub_channels(chat_id)
+        if not channels:
+            return await query.answer("Force-sub is no longer active.", show_alert=True)
+
+        unjoined = await _get_unjoined(client, target_user_id, channels)
+
+        if unjoined:
+            labels = ", ".join(ch["label"] for ch in unjoined)
+            return await query.answer(
+                f"❌ You haven't joined: {labels}\nPlease join and try again.",
+                show_alert=True,
+            )
+
+        # All joined — unmute the user
+        try:
+            await client.restrict_chat_member(
+                chat_id,
+                target_user_id,
+                FULL_PERMISSIONS,
+            )
+        except Exception as e:
+            logger.warning("Could not unmute user %s: %s", target_user_id, e)
+
+        # Update the notice message to show success
+        try:
+            user = query.from_user
+            welcome_text = await db.get_welcome_message(chat_id)
+            fsub_text = await db.get_fsub_message(chat_id) or DEFAULT_FSUB_MSG
+            final_text = welcome_text or fsub_text
+
+            try:
+                chat = await client.get_chat(chat_id)
+                chat_title = chat.title or ""
+            except Exception:
+                chat_title = ""
+
+            text = _format_text(final_text, user, chat_title)
+            keyboard = _welcome_keyboard(channels)
+
+            await query.message.edit_text(
+                text,
+                reply_markup=keyboard,
+                disable_web_page_preview=True,
+            )
+        except Exception as e:
+            logger.warning("Could not edit fsub notice: %s", e)
+
+        await query.answer("✅ Verified! You can now chat.", show_alert=False)
