@@ -34,73 +34,51 @@ async def _is_admin(client: Client, chat_id: int, user_id: int) -> bool:
 # ── /service_delete_on ──────────────────────────────────────
 
 async def cmd_service_delete_on(client: Client, message: Message) -> None:
-    """
-    Admin command: enable auto-deletion of join/leave service messages.
-    Bot must have 'Delete Messages' admin permission to actually delete.
-    """
-    # Groups only
     if message.chat.type.value == "private":
-        await message.reply_text("⚠️ This command works in groups only.")
+        await message.reply_text("ᴛʜɪꜱ ᴄᴏᴍᴍᴀɴᴅ ᴡᴏʀᴋꜱ ɪɴ ɢʀᴏᴜᴘꜱ ᴏɴʟʏ.")
         return
 
-    # Admin-only gate
-    if not await _is_admin(client, message.chat.id, message.from_user.id):
-        await message.reply_text("🚫 Only admins can use this command.")
+    if message.from_user and not await _is_admin(client, message.chat.id, message.from_user.id):
+        await message.reply_text("ᴀᴅᴍɪɴꜱ ᴏɴʟʏ.")
         return
 
     await set_service_delete(message.chat.id, enabled=True)
-    logger.info("ServiceDelete ENABLED  chat=%s by user=%s", message.chat.id, message.from_user.id)
+    actor = message.from_user.id if message.from_user else "anonymous_admin"
+    logger.info("ServiceDelete ENABLED  chat=%s by user=%s", message.chat.id, actor)
 
     await message.reply_text(
-        "✅ ꜱᴇʀᴠɪᴄᴇ ᴍᴇꜱꜱᴀɢᴇ\n"
-        "ᴀᴜᴛᴏ-ᴅᴇʟᴇᴛᴇ : ᴏɴ\n\n"
-        "ᴊᴏɪɴ ᴀɴᴅ ʟᴇᴀᴠᴇ\n"
-        "ꜱᴇʀᴠɪᴄᴇ ᴍᴇꜱꜱᴀɢᴇꜱ\n"
-        "ᴡɪʟʟ ɴᴏᴡ ʙᴇ\n"
-        "ᴅᴇʟᴇᴛᴇᴅ ᴀᴜᴛᴏᴍᴀᴛɪᴄᴀʟʟʏ.\n\n"
-        "• ɴᴇᴡ_ᴄʜᴀᴛ_ᴍᴇᴍʙᴇʀꜱ\n"
-        "• ʟᴇꜰᴛ_ᴄʜᴀᴛ_ᴍᴇᴍʙᴇʀ\n\n"
-        "ᴍᴀᴋᴇ ꜱᴜʀᴇ ʙᴏᴛ ʜᴀꜱ\n"
-        "ᴅᴇʟᴇᴛᴇ ᴍᴇꜱꜱᴀɢᴇꜱ ᴘᴇʀᴍɪꜱꜱɪᴏɴ."
+        "ꜱᴇʀᴠɪᴄᴇ ᴍᴇꜱꜱᴀɢᴇ ᴀᴜᴛᴏ-ᴅᴇʟᴇᴛᴇ : ᴏɴ\n\n"
+        "ᴊᴏɪɴ ᴀɴᴅ ʟᴇᴀᴠᴇ ꜱᴇʀᴠɪᴄᴇ ᴍᴇꜱꜱᴀɢᴇꜱ\n"
+        "ᴡɪʟʟ ɴᴏᴡ ʙᴇ ᴅᴇʟᴇᴛᴇᴅ ᴀᴜᴛᴏᴍᴀᴛɪᴄᴀʟʟʏ.\n\n"
+        "ᴍᴀᴋᴇ ꜱᴜʀᴇ ʙᴏᴛ ʜᴀꜱ ᴅᴇʟᴇᴛᴇ ᴍᴇꜱꜱᴀɢᴇꜱ ᴘᴇʀᴍɪꜱꜱɪᴏɴ."
     )
 
 
 # ── /service_delete_off ─────────────────────────────────────
 
 async def cmd_service_delete_off(client: Client, message: Message) -> None:
-    """
-    Admin command: disable auto-deletion of join/leave service messages.
-    """
-    # Groups only
     if message.chat.type.value == "private":
-        await message.reply_text("⚠️ This command works in groups only.")
+        await message.reply_text("ᴛʜɪꜱ ᴄᴏᴍᴍᴀɴᴅ ᴡᴏʀᴋꜱ ɪɴ ɢʀᴏᴜᴘꜱ ᴏɴʟʏ.")
         return
 
-    # Admin-only gate
-    if not await _is_admin(client, message.chat.id, message.from_user.id):
-        await message.reply_text("🚫 Only admins can use this command.")
+    if message.from_user and not await _is_admin(client, message.chat.id, message.from_user.id):
+        await message.reply_text("ᴀᴅᴍɪɴꜱ ᴏɴʟʏ.")
         return
 
     await set_service_delete(message.chat.id, enabled=False)
-    logger.info("ServiceDelete DISABLED chat=%s by user=%s", message.chat.id, message.from_user.id)
+    actor = message.from_user.id if message.from_user else "anonymous_admin"
+    logger.info("ServiceDelete DISABLED chat=%s by user=%s", message.chat.id, actor)
 
     await message.reply_text(
-        "🔴 ꜱᴇʀᴠɪᴄᴇ ᴍᴇꜱꜱᴀɢᴇ\n"
-        "ᴀᴜᴛᴏ-ᴅᴇʟᴇᴛᴇ : ᴏꜰꜰ\n\n"
-        "ᴊᴏɪɴ ᴀɴᴅ ʟᴇᴀᴠᴇ\n"
-        "ᴍᴇꜱꜱᴀɢᴇꜱ ᴡɪʟʟ\n"
-        "ɴᴏ ʟᴏɴɢᴇʀ ʙᴇ\n"
-        "ᴀᴜᴛᴏ-ᴅᴇʟᴇᴛᴇᴅ.\n\n"
-        "ᴜꜱᴇ /service_delete_on\n"
-        "ᴛᴏ ʀᴇ-ᴇɴᴀʙʟᴇ."
+        "ꜱᴇʀᴠɪᴄᴇ ᴍᴇꜱꜱᴀɢᴇ ᴀᴜᴛᴏ-ᴅᴇʟᴇᴛᴇ : ᴏꜰꜰ\n\n"
+        "ᴊᴏɪɴ ᴀɴᴅ ʟᴇᴀᴠᴇ ᴍᴇꜱꜱᴀɢᴇꜱ ᴡɪʟʟ ɴᴏ ʟᴏɴɢᴇʀ ʙᴇ ᴀᴜᴛᴏ-ᴅᴇʟᴇᴛᴇᴅ.\n\n"
+        "/service_delete_on — ʀᴇ-ᴇɴᴀʙʟᴇ"
     )
 
 
 # ── Registration helper ─────────────────────────────────────
 
 def register_service_delete_commands(app: Client) -> None:
-    """Bind command handlers. Called from handler.py."""
     app.on_message(filters.command("service_delete_on"))(cmd_service_delete_on)
     app.on_message(filters.command("service_delete_off"))(cmd_service_delete_off)
     logger.info("✅ ServiceDelete commands registered (/service_delete_on | off).")
-    
