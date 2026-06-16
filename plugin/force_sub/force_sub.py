@@ -18,7 +18,7 @@ import hashlib
 import logging
 from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
-from pyrogram import Client, filters
+from pyrogram import Client, filters, enums
 from pyrogram.types import (
     Message,
     InlineKeyboardMarkup,
@@ -322,9 +322,13 @@ async def _send_force_sub_notice(client: Client, message: Message, user, not_joi
 
     custom_template = await get_force_sub_message(chat_id)
     if custom_template:
+        first_name = user.first_name or ""
+        username = f"@{user.username}" if user.username else user.first_name or ""
         text = (
             custom_template
             .replace("{mention}", mention)
+            .replace("{first_name}", first_name)
+            .replace("{username}", username)
             .replace("{title}", message.chat.title or "")
             .replace("{count}", str(count))
             .replace("{channels}", join_text)
@@ -348,6 +352,7 @@ async def _send_force_sub_notice(client: Client, message: Message, user, not_joi
         chat_id,
         text,
         reply_markup=keyboard,
+        parse_mode=enums.ParseMode.HTML,
     )
 
     _FORCE_NOTICE_STATE[state_key] = {
@@ -529,25 +534,37 @@ def register_force_sub(app: Client):
         if not await _is_admin(client, message.chat.id, message.from_user.id):
             return await message.reply_text("❌ Admins only.")
 
-        parts = message.text.split(maxsplit=1)
+        text_input = message.text or message.caption or ""
+        parts = text_input.split(maxsplit=1)
         if len(parts) < 2:
             return await message.reply_text(
                 f"{BORDER}\n"
                 "ғᴏʀᴄᴇ • sᴜʙsᴄʀɪʙᴇ\n"
                 f"{BORDER}\n\n"
                 "ᴜsᴀɢᴇ :\n"
-                "/setfsubmsg <message>\n\n"
+                "/setfsubmsg &lt;message&gt;\n\n"
                 "ᴘʟᴀᴄᴇʜᴏʟᴅᴇʀs :\n"
-                "{mention} - ᴜsᴇʀ ᴍᴇɴᴛɪᴏɴ\n"
-                "{title} - ɢʀᴏᴜᴘ ɴᴀᴍᴇ\n"
-                "{count} - ᴄʜᴀɴɴᴇʟs ʟᴇғᴛ ᴛᴏ ᴊᴏɪɴ\n"
-                "{channels} - ʀᴇǫᴜɪʀᴇᴅ ᴄʜᴀɴɴᴇʟ(s) ᴛᴇxᴛ\n\n"
-                "ᴜsᴇ /resetfsubmsg ᴛᴏ ʀᴇsᴛᴏʀᴇ ᴅᴇғᴀᴜʟᴛ.\n\n"
+                "{mention} — ᴜsᴇʀ ᴍᴇɴᴛɪᴏɴ\n"
+                "{first_name} — ғɪʀsᴛ ɴᴀᴍᴇ\n"
+                "{username} — @ᴜsᴇʀɴᴀᴍᴇ\n"
+                "{title} — ɢʀᴏᴜᴘ ɴᴀᴍᴇ\n"
+                "{count} — ᴄʜᴀɴɴᴇʟs ʟᴇғᴛ\n"
+                "{channels} — ʀᴇǫᴜɪʀᴇᴅ ᴄʜᴀɴɴᴇʟ ᴛᴇxᴛ\n\n"
+                "ᴜsᴇ /delfsubmsg ᴛᴏ ʀᴇsᴇᴛ.\n\n"
                 f"{BORDER}"
             )
 
         await set_force_sub_message(message.chat.id, parts[1])
-        await message.reply_text("✅ Force-sub message updated.")
+        preview = parts[1][:60] + ("..." if len(parts[1]) > 60 else "")
+        await message.reply_text(
+            f"{BORDER}\n"
+            "ғᴏʀᴄᴇ • sᴜʙsᴄʀɪʙᴇ\n"
+            f"{BORDER}\n\n"
+            "✅ FORCE-SUB NOTICE MESSAGE SAVED!\n\n"
+            "━━━━━━━━━━━━━━━━━━━━\n"
+            f"{preview}\n\n"
+            f"{BORDER}"
+        )
 
     # ── /resetfsubmsg ─────────────────────────────────────────
     @app.on_message(filters.command("resetfsubmsg") & filters.group)
@@ -615,7 +632,8 @@ def register_force_sub(app: Client):
         if not await _is_admin(client, message.chat.id, message.from_user.id):
             return await message.reply_text("❌ Admins only.")
 
-        parts = message.text.split(maxsplit=1)
+        text_input = message.text or message.caption or ""
+        parts = text_input.split(maxsplit=1)
         if len(parts) < 2:
             return await message.reply_text(
                 f"{BORDER}\n"
