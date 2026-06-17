@@ -54,7 +54,7 @@ from pyrogram.types import (
     InlineKeyboardButton,
     ChatPermissions,
 )
-import db
+from . import db
 from plugin.group_guard.group_guard import group_is_approved
 
 logger = logging.getLogger(__name__)
@@ -83,11 +83,67 @@ FULL_PERMISSIONS = ChatPermissions(
     can_add_web_page_previews=True,
 )
 
-# Pre-defined sticker file_ids used at Stage 1. Replace with your own.
+# Pre-defined sticker file_ids used at Stage 1.
 _FORCE_SUB_STICKERS_RAW = [
-    "CAACAgUAAxkBAAEBp1ZgABXXXXXXXXXXXXXXXXXXXXXXXXXXXAACXXXXXXXXXXXXXXXXX",
-    "CAACAgUAAxkBAAEBp1dgABXXXXXXXXXXXXXXXXXXXXXXXXXXXAACXXXXXXXXXXXXXXXXX",
-    "CAACAgUAAxkBAAEBp1lgABXXXXXXXXXXXXXXXXXXXXXXXXXXXAACXXXXXXXXXXXXXXXXX",
+    "CAACAgUAAxkBAAMKail5j184VypN5uOha5rRg2dJPxsAAm0VAAI-GflVgXogIGmIUZoeBA",
+    "CAACAgUAAxkBAAMMail7NYTQGA50wProtTQQkVm3RzIAAuAcAAKgInhWJuNkodC0RckeBA",
+    "CAACAgUAAxkBAAMOail7P_W4-9GUQUBh8MKYIodaw9oAAnkUAALujklVOHjXNcpSGEoeBA",
+    "CAACAgUAAxkBAAMQail7b5hyrRIo3_8yxVRvV2IvxC4AAqIWAAJ68olW1fjwcYyIpekeBA",
+    "CAACAgUAAxkBAAMSail7e3naQMRCkSqP_q4tFu0PcucAAisMAAKbQ_BUYlO7yJ5mCMEeBA",
+    "CAACAgUAAxkBAAMUail7fd3XM1tf1dp5g96c-2SCxWAAAkYQAAKJiPlU6f0rnJ6P0yceBA",
+    "CAACAgUAAxkBAAMYail7hg9RHEtZkctsaz5eoYdXJ-AAAnsOAAIuCwFVim60eOoCzDseBA",
+    "CAACAgUAAxkBAAMaail7lD4MARmj9OU00cYrldtx6L4AAikVAAJYKslVNIXBL7NC7p0eBA",
+    "CAACAgQAAxkBAAMcail7n1YYksUjYan3ESPMLWJu7YQAAmgVAAJmU7FT66oEPHt1-FMeBA",
+    "CAACAgQAAxkBAAMeail7oWhk6t7q7chFOye3hJhr1dwAAuUaAAK5BkFR5LS7HeEeAAH_HgQ",
+    "CAACAgQAAxkBAAMgail7opXWusM8I6e1ERhAFyN9zGMAArwPAAIl-EBRCWIoGs7F3ugeBA",
+    "CAACAgQAAxkBAAMiail7oyzFxiKvKWsgm3jayDzc2b0AAtwPAAIFzLhTY3hSxh26_5oeBA",
+    "CAACAgQAAxkBAAMkail7o7vAOJT-oQtLXhzg8e5mVL0AAowPAAI-ewABUNoyQziVBA8sHgQ",
+    "CAACAgQAAxkBAAMmail7pWEpp3JTsgojkUbPkFQ_qOMAAssVAAKu7ilTDHwqZT5wLcQeBA",
+    "CAACAgQAAxkBAAMoail7pv7HmAQh61BDYaQoOvtRGowAAjgPAAJ113hQ2gPCMIFDCREeBA",
+    "CAACAgQAAxkBAAMqail7qM4AATvYvou7Y7riomfXdQABXgACGhEAAujCcFDHVO-cIWfv3x4E",
+    "CAACAgQAAxkBAAMsail7qeGLjbRsS8eiadJ28DV2ZKoAAqUNAAIKskFSaiuEZPmFuSseBA",
+    "CAACAgQAAxkBAAMuail7qgO0Ps9ZuklDFof-Y8Shh7wAAg0UAAK87nlQEc4LvX3OTfoeBA",
+    "CAACAgQAAxkBAAMwail7rcVdH02-qfRqW8qVDCBdtaQAAo4PAAJnGWhQJBPPbFiEOEIeBA",
+    "CAACAgQAAxkBAAMyail7rhkWDsxd5wEP-aUEsAFEVekAAu4OAAKcX1hSX0DJLZWx9M4eBA",
+    "CAACAgQAAxkBAAM0ail7r7Ckb7Sx4oVAi7Me6ElXjN0AAtMWAAJ4gPBRQJdDlFUEjj8eBA",
+    "CAACAgQAAxkBAAM2ail7sBoq7L1TcvGr9rXLysIVgJMAAp8VAAIo41hQXxgectU3fdoeBA",
+    "CAACAgQAAxkBAAM4ail7sbJRexmEhBhqiG2CTbJICHcAAngUAAIbzllQrMIOmAlyPN8eBA",
+    "CAACAgQAAxkBAAM6ail7s77OzajeblA_abdzlaIkoOwAAq4RAAJ8CvFQZv7xhrhDDrUeBA",
+    "CAACAgQAAxkBAAM8ail7tH3AvwxYfcQVU9TPYQM6iBgAAqkYAAKgrFFSq6xrbz5QK2seBA",
+    "CAACAgQAAxkBAAM-ail7tVp3UVCAEONfIO0BnC9_F6sAAjIbAALpeBhShPjGWqux7wQeBA",
+    "CAACAgQAAxkBAANAail7t6BDeUmR7_VAuUvRiVEO8QEAAtIdAALP3ZhRz6l8TY7EK-QeBA",
+    "CAACAgQAAxkBAANCail7uOMXXIyc-8LiMPpuid79wegAAuoRAAImR3BQe4NoAtilxMUeBA",
+    "CAACAgQAAxkBAANEail7uuThWyWL-kKPqAAC3GSoauMAAhYWAAIYexFT1RXZqaqBOsMeBA",
+    "CAACAgQAAxkBAANGail7v1k1_EFd6aOyGV_fh9wdnTkAAh0VAALVIihTuWparDU7dnceBA",
+    "CAACAgQAAxkBAANIail7xcfNZe_-GIgpGhWUEsxHZcYAAk0UAALQBgABU7vo8pNFFc8OHgQ",
+    "CAACAgUAAxkBAANKail76V9bDP577BmyVWhuDxN3K-EAAp8TAAKQlulXo4PLxIKpqSceBA",
+    "CAACAgUAAxkBAANMail76kGZZz2KlH7N32zlzg8XyyEAAhgSAAKYzehXXgs42Su-oLceBA",
+    "CAACAgUAAxkBAANOail7646aSehFDdkS3-DA6uNXOt4AAnoVAAK-5OlXnDljvB-x2jkeBA",
+    "CAACAgUAAxkBAANQail761sSgH1lIDAw0gplPodagT8AAmETAAI_IuhXruhPpRhDlI4eBA",
+    "CAACAgUAAxkBAANSail77dFeBhzR0O_V42UvDq5IZdEAAlgRAAKAzelXnHKbu_Qdl1UeBA",
+    "CAACAgUAAxkBAANUail77ihu7l6_L-liXDSUO0-cxpEAAkYXAAKEA-hXI05rQU313IEeBA",
+    "CAACAgUAAxkBAANWail78SwT04iaNhWp9U_1drJ6YrkAAgwVAAKkiQFUl5GASU-h2FweBA",
+    "CAACAgUAAxkBAANYail78WO0kXpEau6zFKHrTuqXgKQAAgcRAAKhVPlXvLBiKaxnDiAeBA",
+    "CAACAgUAAxkBAANaail78no8kyjowMYny7zuVOl93EIAAj8SAAJ0ifFXRDBduvA5FW4eBA",
+    "CAACAgUAAxkBAANcail783pbhfJhtZTYvRZm1gXG5RQAAiwSAAJ5H_lXHIyIyE1OgYoeBA",
+    "CAACAgUAAxkBAANeail79w8zAdHG_8YPurZwk61FqqEAAsMaAAJdJQFUiNgX1groxOkeBA",
+    "CAACAgUAAxkBAANgail794QBlEYHNVhuMW4f1oqvdsgAAi4TAAKRnvhXHtdjvR6AHH4eBA",
+    "CAACAgUAAxkBAANiail7-GQK1FadHHnQztxsfOY_qsoAAosTAALP6QABVOCRqV1xgOFtHgQ",
+    "CAACAgUAAxkBAANkail7-McyKPcw8OEzpFSUNM0WQo0AAiwSAAJ5H_lXHIyIyE1OgYoeBA",
+    "CAACAgUAAxkBAANlail7-F8Ol8THSrODg_ItU5jHXucAApESAAIKrAFUQAABOpLHISMrHgQ",
+    "CAACAgUAAxkBAANoail7-8XEhfhX7euJrBYU4-_ksZEAAk8UAAItcwABVJBjdyuq_9h2HgQ",
+    "CAACAgUAAxkBAANpail7-22Rim0XZZ3-BbPCT4Yv21EAAtoSAALTI_hXKhRrcezWL7seBA",
+    "CAACAgUAAxkBAANuail7_EA0HBi2ohwNM8Y7J2pjwhgAAkUTAAI2IfhXxwmUebW7ddseBA",
+    "CAACAgUAAxkBAANwail7_MZJV52BWqAzQgf3XhCW1OcAAqMRAALmPPhXsYikvAmaVbAeBA",
+    "CAACAgUAAxkBAANyail8E6r27hvKtJnk0bRrsLEbLDUAAkMUAAKnuzBW4o_27asInE0eBA",
+    "CAACAgUAAxkBAAN0ail8FNnx0WiTtgzlfh4-bWNP2D0AAnQSAAJrAeBVHig_EkL5RhkeBA",
+    "CAACAgUAAxkBAAN2ail8Fk39S0capghoPKyHCvQEkZoAAp0fAALAt4FX5uzHYk3LMFEeBA",
+    "CAACAgUAAxkBAAN4ail8GMH0LDtCfBmzO3lOmfZeJ4IAAt0aAAIDoflXLrTQilwOknYeBA",
+    "CAACAgUAAxkBAAN6ail8KEUEUCRGuoMz2qmjIIsVYLMAAxUAAvSAyVUQUJcUBdRt1x4E",
+    "CAACAgUAAxkBAAN8ail8KVX5COMKfX0rXbZYxY3G0wMAAr0YAAICgchVDuZMHaNfrsYeBA",
+    "CAACAgUAAxkBAAN-ail8LAt2lrgwnDhN-OSAsF7WkSgAArMVAAJf2MlVbJAGFCf0agQeBA",
+    "CAACAgUAAxkBAAOAail8MfYECAV2kvTMmIQeZ_pFIAAkMWAAIIG8hVDYEGCypgBigeBA",
+    "CAACAgUAAxkBAAOCail8M97GSBr2YC_ScaLNrsXNLx4AArMWAAK5MvBXOHRY-wx9LWoeBA",
 ]
 
 # ── In-memory cycle state ───────────────────────────────────
@@ -457,13 +513,13 @@ def register_force_sub_plugin(app):
                     _clear_state(chat_id, user_id)
 
             else:
-                # Stage 2 — temporary mute, then full reset
+                # Stage 2 — temporary mute. After unmute, stay at stage=2 so the
+                # next message (if still not joined) goes straight back to mute
+                # without repeating the notice/sticker cycle.
                 try:
                     await client.restrict_chat_member(chat_id, user_id, MUTE_PERMISSIONS)
                 except Exception as e:
                     logger.warning("Could not mute user %s in %s: %s", user_id, chat_id, e)
-
-                _clear_state(chat_id, user_id)
 
                 async def _unmute_later():
                     await asyncio.sleep(MUTE_SECONDS)
@@ -471,6 +527,8 @@ def register_force_sub_plugin(app):
                         await client.restrict_chat_member(chat_id, user_id, FULL_PERMISSIONS)
                     except Exception as e:
                         logger.warning("Could not unmute user %s in %s: %s", user_id, chat_id, e)
+                    # Keep stage at 2 — next offence → immediate remute, no notice/sticker
+                    _set_state(chat_id, user_id, stage=2, notice_id=None)
 
                 asyncio.create_task(_unmute_later())
 
