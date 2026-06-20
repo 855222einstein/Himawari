@@ -12,26 +12,31 @@
 #               notice auto-deletes after 30s, 30s window starts.
 #     Stage 1 → ignored notice + sent again within 30s:
 #               delete message, send random sticker as a REPLY to the
-#               notice, sticker auto-deletes after 10s, fresh 30s window.
-#     Stage 2 → ignored sticker + sent again:
-#               delete message, mute user for 30s (1st mute).
-#               After unmute, advance to stage 3.
-#     Stage 3 → still not joined after 1st mute, sent again:
-#               delete message, mute user for 30s again (2nd mute).
-#               After unmute, advance to stage 4.
-#     Stage 4+ → still not joined after 2nd mute:
-#               delete message, ban user permanently.
+#               notice (falls back to plain send if notice was deleted),
+#               sticker auto-deletes after 10s, fresh 30s window.
+#     Stage 2 → ignored sticker + sent again within 30s:
+#               delete message, mute user for 30s.
+#               State is fully cleared immediately — cycle resets.
+#
+#   If the 30s window expires with no further message, state lapses
+#   automatically — the next message starts fresh at Stage 0.
 #
 #   Burst protection: an asyncio.Lock per (chat_id, user_id) ensures
 #   simultaneous messages (e.g. an album) are processed one at a time,
 #   so only a single notice/sticker is ever sent per cycle step.
 #
 # Commands:
-#   /setfsub  LABEL | @channel  LABEL2 | @channel2
+#   /setfsub   LABEL | @channel  LABEL2 | @channel2
 #   /clearfsub
-#   /setfsubmsg  <text>  (supports {mention} {first_name} {username} {title})
+#   /checkfsub  — diagnostic: tests bot's ability to verify each channel
+#   /setfsubmsg <text>  (supports {mention} {first_name} {username} {title})
 #   /delfsubmsg
 #   /viewfsub
+#
+# IMPORTANT SETUP REQUIREMENT:
+#   The bot must be an ADMIN in every channel listed in /setfsub.
+#   Without admin rights the bot cannot check user membership and
+#   force-sub will not work for that channel.
 # ============================================================
 
 import asyncio
@@ -68,7 +73,11 @@ DEFAULT_FSUB_MSG = (
 
 NOTICE_TTL = 30          # seconds — notice/sticker auto-delete window & stage timeout
 STICKER_TTL = 10         # seconds — sticker auto-delete delay
-MUTE_SECONDS = 30        # seconds — temporary mute duration (both 1st and 2nd mute)
+MUTE_SECONDS = 30        # seconds — temporary mute duration
+ADMIN_WARN_COOLDOWN = 1800  # seconds — how often to remind admin about broken channels
+
+# Tracks last time admin was warned per chat: {chat_id: timestamp}
+_ADMIN_WARN_LAST: dict[int, float] = {}
 
 MUTE_PERMISSIONS = ChatPermissions(
     can_send_messages=False,
@@ -149,7 +158,7 @@ _FORCE_SUB_STICKERS_RAW = [
 
 # ── In-memory cycle state ───────────────────────────────────
 # key = (chat_id, user_id) -> {
-#     "stage": int,            # 0=notice, 1=sticker, 2=1st mute, 3=2nd mute, 4+=ban
+#     "stage": int,            # 0=notice sent, 1=sticker sent, 2=mute pending
 #     "expires_at": float,     # monotonic time when this stage's window lapses
 #     "notice_id": int | None, # message_id of the active fsub notice (Stage 1 replies to it)
 # }
@@ -180,10 +189,10 @@ def _get_state(chat_id: int, user_id: int) -> dict | None:
     return state
 
 
-def _set_state(chat_id: int, user_id: int, stage: int, notice_id: int | None):
+def _set_state(chat_id: int, user_id: int, stage: int, notice_id: int | None, ttl: int = NOTICE_TTL):
     _fsub_state[(chat_id, user_id)] = {
         "stage": stage,
-        "expires_at": time.monotonic() + NOTICE_TTL,
+        "expires_at": time.monotonic() + ttl,
         "notice_id": notice_id,
     }
 
@@ -215,7 +224,6 @@ def _parse_fsub_args(raw: str):
         if not (username.startswith("@") or username.lstrip("-").isdigit()):
             errors.append(f"`{username}` — must be @username or numeric ID")
             continue
-        # Deduplicate by username (case-insensitive)
         if username.lower() in seen_usernames:
             errors.append(f"Duplicate skipped: `{username}`")
             continue
@@ -224,37 +232,57 @@ def _parse_fsub_args(raw: str):
     return channels, errors
 
 
-async def _user_subscribed(client, user_id: int, channel: str) -> bool:
+async def _user_subscribed(client, user_id: int, channel: str) -> tuple[bool, bool]:
+    """
+    Returns (is_subscribed, is_accessible).
+    is_subscribed: True if user is in the channel.
+    is_accessible: False if the bot lacks admin rights to check membership.
+    When is_accessible is False, is_subscribed is meaningless — caller should warn admin.
+    """
     try:
         member = await client.get_chat_member(channel, user_id)
-        return member.status not in (ChatMemberStatus.BANNED, ChatMemberStatus.LEFT)
+        return member.status not in (ChatMemberStatus.BANNED, ChatMemberStatus.LEFT), True
     except UserNotParticipant:
-        return False
+        return False, True
     except (ChatAdminRequired, ChannelPrivate) as e:
-        # Bot genuinely cannot check this channel (kicked, no rights, etc).
-        # Fail OPEN here only — this is a config/permission problem, not a
-        # signal about the user, and blocking everyone would be worse.
-        logger.warning("Cannot check %s membership (admin/access issue): %s", channel, e)
-        return True
+        logger.warning("Cannot check %s membership (bot not admin): %s", channel, e)
+        return True, False  # accessible=False signals the caller to warn admin
     except Exception as e:
-        # Telegram raises things like PeerIdInvalid / UsernameNotOccupied for
-        # users who have NEVER interacted with the channel — not just
-        # UserNotParticipant. Treat any unrecognized error as "not joined".
         logger.warning("Membership check error %s / %s — treating as NOT joined: %s", channel, user_id, e)
+        return False, True
+
+
+async def _check_bot_access(client, bot_id: int, channel: str) -> bool:
+    """Returns True if the bot can check membership in this channel (i.e. is an admin)."""
+    try:
+        member = await client.get_chat_member(channel, bot_id)
+        return member.status in (ChatMemberStatus.ADMINISTRATOR, ChatMemberStatus.OWNER)
+    except (ChatAdminRequired, ChannelPrivate):
+        return False
+    except Exception:
         return False
 
 
-async def _get_unjoined(client, user_id: int, channels: list) -> list:
-    result = []
+async def _get_unjoined(client, user_id: int, channels: list) -> tuple[list, list]:
+    """
+    Returns (unjoined, inaccessible).
+    unjoined     — channels the user has definitely NOT joined.
+    inaccessible — channels the bot cannot check (not admin there).
+    """
+    unjoined = []
+    inaccessible = []
     seen: set[str] = set()
     for ch in channels:
         key = ch["username"].lower()
         if key in seen:
             continue
         seen.add(key)
-        if not await _user_subscribed(client, user_id, ch["username"]):
-            result.append(ch)
-    return result
+        subscribed, accessible = await _user_subscribed(client, user_id, ch["username"])
+        if not accessible:
+            inaccessible.append(ch)
+        elif not subscribed:
+            unjoined.append(ch)
+    return unjoined, inaccessible
 
 
 def _channel_url(username: str) -> str:
@@ -267,7 +295,7 @@ def _channel_url(username: str) -> str:
 
 
 def _join_keyboard(channels: list) -> InlineKeyboardMarkup:
-    """Build the join keyboard. Button text is the admin-set label, no emoji added."""
+    """Build the join keyboard. Button text is the admin-set label."""
     rows = []
     seen: set[str] = set()
     for ch in channels:
@@ -275,7 +303,6 @@ def _join_keyboard(channels: list) -> InlineKeyboardMarkup:
         if key in seen:
             continue
         seen.add(key)
-        # Use the label exactly as set by the admin — no prefix emoji
         rows.append([InlineKeyboardButton(
             ch["label"],
             url=_channel_url(ch["username"])
@@ -357,6 +384,23 @@ def register_force_sub_plugin(app):
             reply += "\n\nSkipped:\n" + "\n".join(errors)
         await message.reply_text(reply, disable_web_page_preview=True)
 
+        # Immediately validate bot can access every channel and warn if not.
+        me = await client.get_me()
+        warn_lines = []
+        for ch in channels:
+            ok = await _check_bot_access(client, me.id, ch["username"])
+            if not ok:
+                warn_lines.append(ch["username"])
+        if warn_lines:
+            await message.reply_text(
+                "⚠️ **Bot is NOT admin in these channels:**\n"
+                + "\n".join(warn_lines) + "\n\n"
+                "Force-sub **will not work** for those channels until you add "
+                "the bot as admin there.\n\n"
+                "**Steps:** Open the channel → Edit → Administrators → Add Admin → select bot.",
+                disable_web_page_preview=True,
+            )
+
     # ── /clearfsub ───────────────────────────────────────────
     @app.on_message(filters.group & filters.command("clearfsub"))
     async def cmd_clearfsub(client, message: Message):
@@ -423,9 +467,22 @@ def register_force_sub_plugin(app):
                 "Use `/setfsub LABEL | @channel` to add one."
             )
 
+        me = await client.get_me()
         lines = ["**Current Force-Sub Channels:**\n"]
+        has_issue = False
         for i, ch in enumerate(channels, 1):
-            lines.append(f"{i}. **{ch['label']}** -> `{ch['username']}`")
+            ok = await _check_bot_access(client, me.id, ch["username"])
+            icon = "✅" if ok else "⚠️"
+            if not ok:
+                has_issue = True
+            lines.append(f"{i}. {icon} **{ch['label']}** -> `{ch['username']}`")
+
+        if has_issue:
+            lines.append(
+                "\n⚠️ Channels marked with ⚠️ will be skipped — "
+                "add the bot as admin there to enable force-sub for them.\n"
+                "Use `/checkfsub` for a detailed status check."
+            )
 
         if fsub_msg:
             lines.append(f"\n**Notice Message:**\n{fsub_msg[:200]}{'...' if len(fsub_msg) > 200 else ''}")
@@ -434,35 +491,42 @@ def register_force_sub_plugin(app):
 
         await message.reply_text("\n".join(lines), disable_web_page_preview=True)
 
-    # ── New member join — welcome only, no fsub check ─────────
-    @app.on_message(filters.group & filters.new_chat_members, group=1)
-    async def fsub_new_member(client, message: Message):
+    # ── /checkfsub ───────────────────────────────────────────
+    @app.on_message(filters.group & filters.command("checkfsub"))
+    async def cmd_checkfsub(client, message: Message):
         if not await group_is_approved(message.chat.id):
             return
+        member = await client.get_chat_member(message.chat.id, message.from_user.id)
+        if not (member.privileges and member.privileges.can_manage_chat):
+            return await message.reply_text("Admins only.")
 
         channels = await db.get_fsub_channels(message.chat.id)
         if not channels:
-            return  # force-sub not configured
+            return await message.reply_text(
+                "No force-sub channels configured.\n"
+                "Use `/setfsub LABEL | @channel` to add channels."
+            )
 
         me = await client.get_me()
-        welcome_text = await db.get_welcome_message(message.chat.id)
-        fsub_text = await db.get_fsub_message(message.chat.id) or DEFAULT_FSUB_MSG
-        text_template = welcome_text or fsub_text
+        lines = ["**Force-Sub Channel Diagnostic:**\n"]
+        all_ok = True
+        for ch in channels:
+            ok = await _check_bot_access(client, me.id, ch["username"])
+            if ok:
+                lines.append(f"✅ **{ch['label']}** (`{ch['username']}`) — Bot is admin, membership checks work.")
+            else:
+                all_ok = False
+                lines.append(f"⚠️ **{ch['label']}** (`{ch['username']}`) — Bot is NOT admin here. Force-sub bypassed.")
 
-        for user in message.new_chat_members:
-            if user.id == me.id or user.is_bot:
-                continue
+        if all_ok:
+            lines.append("\n✅ All channels are accessible. Force-sub is fully operational.")
+        else:
+            lines.append(
+                "\n**Fix:** Go to each ⚠️ channel → Edit → Administrators → "
+                "Add Admin → select the bot. Run `/checkfsub` again after fixing."
+            )
 
-            text = _format_text(text_template, user, message.chat.title)
-            try:
-                await client.send_message(
-                    message.chat.id,
-                    text,
-                    reply_markup=_join_keyboard(channels),
-                    disable_web_page_preview=True,
-                )
-            except Exception as e:
-                logger.error("Failed to send welcome message: %s", e)
+        await message.reply_text("\n".join(lines), disable_web_page_preview=True)
 
     # ── Message-based escalation cycle ─────────────────────────
     @app.on_message(filters.group & ~filters.service, group=2)
@@ -480,23 +544,96 @@ def register_force_sub_plugin(app):
         if not channels:
             return  # force-sub not configured
 
+        # ── Self-reference guard ─────────────────────────────────
+        # Skip any channel whose username is the same as the current group.
+        # A user is always a "member" of the group they're already in, so
+        # keeping it as a force-sub requirement would bypass enforcement forever.
+        try:
+            chat_obj = await client.get_chat(chat_id)
+            self_usernames: set[str] = set()
+            if chat_obj.username:
+                self_usernames.add(f"@{chat_obj.username}".lower())
+            self_usernames.add(str(chat_id).lower())
+        except Exception:
+            self_usernames = set()
+
+        skipped_self = [ch for ch in channels if ch["username"].lower() in self_usernames]
+        channels = [ch for ch in channels if ch["username"].lower() not in self_usernames]
+
+        if skipped_self:
+            logger.warning(
+                "chat %s — force-sub channels %s are the group itself and were skipped. "
+                "Remove them with /clearfsub and re-add only external channels.",
+                chat_id, [ch["username"] for ch in skipped_self]
+            )
+            # Warn admin in-group once about self-referencing config
+            now = time.time()
+            last_warn = _ADMIN_WARN_LAST.get(chat_id, 0)
+            if now - last_warn >= ADMIN_WARN_COOLDOWN:
+                _ADMIN_WARN_LAST[chat_id] = now
+                names = ", ".join(f"`{ch['username']}`" for ch in skipped_self)
+                try:
+                    asyncio.create_task(client.send_message(
+                        chat_id,
+                        f"⚠️ **Force-sub config issue!**\n\n"
+                        f"{names} is the same as this group — users are already members, so "
+                        f"force-sub can never enforce it.\n\n"
+                        f"**Fix:** Use `/clearfsub` then `/setfsub` with only your external "
+                        f"channels/groups (not this group itself).\n\n"
+                        f"_(This reminder appears once every 30 minutes.)_",
+                        disable_web_page_preview=True,
+                    ))
+                except Exception as e:
+                    logger.warning("Could not send self-ref warning: %s", e)
+
+        if not channels:
+            return  # all configured channels were the group itself — nothing to enforce
+
         lock = _get_lock(chat_id, user_id)
         async with lock:
-            unjoined = await _get_unjoined(client, user_id, channels)
+            unjoined, inaccessible = await _get_unjoined(client, user_id, channels)
+
+            logger.info(
+                "fsub check — chat=%s user=%s unjoined=%s inaccessible=%s",
+                chat_id, user_id,
+                [ch["username"] for ch in unjoined],
+                [ch["username"] for ch in inaccessible],
+            )
+
+            # If some channels can't be checked, warn the admin in-group (with cooldown).
+            if inaccessible:
+                now = time.time()
+                last_warn = _ADMIN_WARN_LAST.get(chat_id, 0)
+                if now - last_warn >= ADMIN_WARN_COOLDOWN:
+                    _ADMIN_WARN_LAST[chat_id] = now
+                    names = ", ".join(f"`{ch['username']}`" for ch in inaccessible)
+                    try:
+                        asyncio.create_task(client.send_message(
+                            chat_id,
+                            f"⚠️ **Force-sub setup issue detected!**\n\n"
+                            f"The bot is **not an admin** in: {names}\n\n"
+                            f"Force-sub is bypassed for those channels. To fix:\n"
+                            f"Open each channel → Edit → Administrators → Add Admin → select the bot.\n\n"
+                            f"Run `/checkfsub` to verify all channels are set up correctly.\n\n"
+                            f"_(This reminder appears once every 30 minutes.)_",
+                            disable_web_page_preview=True,
+                        ))
+                    except Exception as e:
+                        logger.warning("Could not send admin warning: %s", e)
 
             if not unjoined:
-                # Subscribed to everything — clear any stale state, let message through.
+                # Subscribed to everything accessible — clear any stale state, let message through.
                 _clear_state(chat_id, user_id)
                 return
 
             state = _get_state(chat_id, user_id)
             stage = state["stage"] if state else 0
 
-            # Always remove the offending message first.
+            # Always delete the offending message first.
             await _safe_delete(client, chat_id, message.id)
 
             if stage == 0:
-                # Stage 0 — first warning notice with join buttons
+                # ── Stage 0: first warning notice with join buttons ──────
                 fsub_text = await db.get_fsub_message(chat_id) or DEFAULT_FSUB_MSG
                 notice_text = _format_text(fsub_text, message.from_user, message.chat.title)
                 keyboard = _join_keyboard(unjoined)
@@ -514,67 +651,50 @@ def register_force_sub_plugin(app):
                     _clear_state(chat_id, user_id)
 
             elif stage == 1:
-                # Stage 1 — sticker warning, replying to the original notice
+                # ── Stage 1: random sticker, replying to the notice ──────
+                # If the notice was already auto-deleted, fall back to plain send.
                 sticker_id = random.choice(_FORCE_SUB_STICKERS_RAW)
                 notice_id = state.get("notice_id") if state else None
-                try:
-                    sticker_msg = await client.send_sticker(
-                        chat_id,
-                        sticker_id,
-                        reply_to_message_id=notice_id,
-                    )
+                sticker_msg = None
+                # Try with reply first
+                if notice_id:
+                    try:
+                        sticker_msg = await client.send_sticker(
+                            chat_id,
+                            sticker_id,
+                            reply_to_message_id=notice_id,
+                        )
+                    except (MessageIdInvalid, Exception) as e:
+                        if not isinstance(e, MessageIdInvalid):
+                            logger.error("Failed to send fsub sticker (with reply): %s", e)
+                        sticker_msg = None
+                # Fallback: send without reply if reply failed or notice_id was None
+                if sticker_msg is None:
+                    try:
+                        sticker_msg = await client.send_sticker(chat_id, sticker_id)
+                    except Exception as e:
+                        logger.error("Failed to send fsub sticker (fallback): %s", e)
+                if sticker_msg is not None:
                     asyncio.create_task(_delayed_delete(client, chat_id, sticker_msg.id, STICKER_TTL))
-                    _set_state(chat_id, user_id, stage=2, notice_id=notice_id)
-                except Exception as e:
-                    logger.error("Failed to send fsub sticker: %s", e)
-                    _clear_state(chat_id, user_id)
-
-            elif stage == 2:
-                # Stage 2 — 1st mute (30s). After unmute, advance to stage 3.
-                try:
-                    await client.restrict_chat_member(chat_id, user_id, MUTE_PERMISSIONS)
-                except Exception as e:
-                    logger.warning("Could not mute user %s in %s: %s", user_id, chat_id, e)
-
-                async def _unmute_first(cid=chat_id, uid=user_id):
-                    await asyncio.sleep(MUTE_SECONDS)
-                    try:
-                        await client.restrict_chat_member(cid, uid, FULL_PERMISSIONS)
-                    except Exception as e:
-                        logger.warning("Could not unmute user %s in %s: %s", uid, cid, e)
-                    # Advance to stage 3 — next offence triggers second mute
-                    _set_state(cid, uid, stage=3, notice_id=None)
-
-                asyncio.create_task(_unmute_first())
-
-            elif stage == 3:
-                # Stage 3 — 2nd mute (30s). After unmute, advance to stage 4 (ban next).
-                try:
-                    await client.restrict_chat_member(chat_id, user_id, MUTE_PERMISSIONS)
-                except Exception as e:
-                    logger.warning("Could not mute user %s in %s: %s", user_id, chat_id, e)
-
-                async def _unmute_second(cid=chat_id, uid=user_id):
-                    await asyncio.sleep(MUTE_SECONDS)
-                    try:
-                        await client.restrict_chat_member(cid, uid, FULL_PERMISSIONS)
-                    except Exception as e:
-                        logger.warning("Could not unmute user %s in %s: %s", uid, cid, e)
-                    # Advance to stage 4 — next offence triggers permanent ban
-                    _set_state(cid, uid, stage=4, notice_id=None)
-
-                asyncio.create_task(_unmute_second())
+                _set_state(chat_id, user_id, stage=2, notice_id=notice_id)
 
             else:
-                # Stage 4+ — permanent ban
+                # ── Stage 2: temporary mute (30s), then full cycle reset ──
                 try:
-                    await client.ban_chat_member(chat_id, user_id)
-                    logger.info(
-                        "Banned user %s from %s for repeated force-sub violations.",
-                        user_id, chat_id
-                    )
+                    await client.restrict_chat_member(chat_id, user_id, MUTE_PERMISSIONS)
                 except Exception as e:
-                    logger.warning("Could not ban user %s in %s: %s", user_id, chat_id, e)
+                    logger.warning("Could not mute user %s in %s: %s", user_id, chat_id, e)
+
+                # Clear state immediately — cycle fully resets once mute lifts.
                 _clear_state(chat_id, user_id)
+
+                async def _unmute_later(cid=chat_id, uid=user_id):
+                    await asyncio.sleep(MUTE_SECONDS)
+                    try:
+                        await client.restrict_chat_member(cid, uid, FULL_PERMISSIONS)
+                    except Exception as e:
+                        logger.warning("Could not unmute user %s in %s: %s", uid, cid, e)
+
+                asyncio.create_task(_unmute_later())
 
         message.stop_propagation()
