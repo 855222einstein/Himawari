@@ -18,6 +18,7 @@ import re
 import time
 import db
 from plugin.group_guard.group_guard import group_is_approved
+from plugin.force_sub import db as fsub_db
 
 DEFAULT_WELCOME = "👋 Welcome {mention} to {title}!"
 
@@ -174,13 +175,69 @@ async def build_welcome_keyboard(chat_id: int):
     return InlineKeyboardMarkup(keyboard) if keyboard else None
 
 
+def _fsub_channel_url(username: str) -> str:
+    if username.startswith("@"):
+        return f"https://t.me/{username.lstrip('@')}"
+    clean = str(username).lstrip("-")
+    if clean.startswith("100"):
+        clean = clean[3:]
+    return f"https://t.me/c/{clean}"
+
+
+async def _build_combined_keyboard(chat_id: int) -> InlineKeyboardMarkup | None:
+    """Welcome buttons + force-sub channel buttons merged into one keyboard."""
+    rows = []
+
+    saved = await db.get_welcome_buttons(chat_id)
+    if saved:
+        if isinstance(saved, list) and saved and isinstance(saved[0], dict):
+            for btn in saved:
+                text = btn.get("text")
+                url = btn.get("url")
+                if text and url and is_valid_url(url):
+                    rows.append([InlineKeyboardButton(text, url=url)])
+        elif isinstance(saved, list):
+            for row in saved:
+                if not isinstance(row, list):
+                    continue
+                btn_row = []
+                for btn in row:
+                    if not isinstance(btn, dict):
+                        continue
+                    text = btn.get("text")
+                    url = btn.get("url")
+                    if text and url and is_valid_url(url):
+                        btn_row.append(InlineKeyboardButton(text, url=url))
+                if btn_row:
+                    rows.append(btn_row)
+
+    try:
+        fsub_channels = await fsub_db.get_fsub_channels(chat_id)
+        if fsub_channels:
+            existing_urls = {
+                btn.url
+                for row in rows
+                for btn in row
+                if hasattr(btn, "url")
+            }
+            for ch in fsub_channels:
+                url = _fsub_channel_url(ch["username"])
+                if url not in existing_urls:
+                    rows.append([InlineKeyboardButton(ch["label"], url=url)])
+                    existing_urls.add(url)
+    except Exception as e:
+        logger.warning("Could not load fsub channels for welcome keyboard: %s", e)
+
+    return InlineKeyboardMarkup(rows) if rows else None
+
+
 async def handle_welcome(client, chat_id: int, users: list, chat_title: str):
     status = await db.get_welcome_status(chat_id)
     if not status:
         return
 
     welcome_text = await db.get_welcome_message(chat_id) or DEFAULT_WELCOME
-    reply_markup = await build_welcome_keyboard(chat_id)
+    reply_markup = await _build_combined_keyboard(chat_id)
 
     for user in users:
         if _is_duplicate_welcome(chat_id, user.id):
