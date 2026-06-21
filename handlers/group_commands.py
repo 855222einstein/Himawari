@@ -17,6 +17,7 @@ import logging
 import re
 import time
 import db
+from config import LOG_CHAT_ID
 from plugin.group_guard.group_guard import group_is_approved
 from plugin.force_sub import db as fsub_db
 
@@ -220,15 +221,50 @@ async def _build_combined_keyboard(chat_id: int) -> InlineKeyboardMarkup | None:
                 for btn in row
                 if hasattr(btn, "url")
             }
+            # Collect unique fsub buttons then pair them 2 per row
+            fsub_btns = []
             for ch in fsub_channels:
                 url = _fsub_channel_url(ch["username"])
                 if url not in existing_urls:
-                    rows.append([InlineKeyboardButton(ch["label"], url=url)])
+                    fsub_btns.append(InlineKeyboardButton(ch["label"], url=url))
                     existing_urls.add(url)
+            for i in range(0, len(fsub_btns), 2):
+                rows.append(fsub_btns[i:i + 2])
     except Exception as e:
         logger.warning("Could not load fsub channels for welcome keyboard: %s", e)
 
     return InlineKeyboardMarkup(rows) if rows else None
+
+
+async def _log_member_event(client, event: str, chat_id: int, chat_title: str, user):
+    """Send join/leave log to LOG_CHAT_ID with a user-ID button."""
+    if not LOG_CHAT_ID:
+        return
+    icon = "👋" if event == "join" else "🚪"
+    action = "USER JOINED" if event == "join" else "USER LEFT"
+    name = (user.first_name or "") + (" " + user.last_name if user.last_name else "")
+    username_line = f"@{user.username}" if user.username else "ɴᴏɴᴇ"
+    text = (
+        f"━━━━━━━━━━━━━━━━━━\n\n"
+        f"{icon} <b>{action}</b>\n\n"
+        f"━━━━━━━━━━━━━━━━━━\n\n"
+        f"<b>ɴᴀᴍᴇ</b>       : {name.strip()}\n"
+        f"<b>ᴜꜱᴇʀɴᴀᴍᴇ</b>   : {username_line}\n\n"
+        f"<b>ᴄʜᴀᴛ</b>       : {chat_title or str(chat_id)}\n"
+        f"<b>ᴄʜᴀᴛ ɪᴅ</b>    : <code>{chat_id}</code>\n\n"
+        f"━━━━━━━━━━━━━━━━━━"
+    )
+    keyboard = InlineKeyboardMarkup([
+        [InlineKeyboardButton(f"👤 User ID : {user.id}", callback_data=f"uid:{user.id}")]
+    ])
+    try:
+        await client.send_message(
+            LOG_CHAT_ID, text,
+            reply_markup=keyboard,
+            disable_web_page_preview=True,
+        )
+    except Exception as e:
+        logger.warning("Could not send member log: %s", e)
 
 
 async def handle_welcome(client, chat_id: int, users: list, chat_title: str):
@@ -272,6 +308,11 @@ async def handle_welcome(client, chat_id: int, users: list, chat_title: str):
 
 def register_group_commands(app: Client):
 
+    @app.on_callback_query(filters.regex(r"^uid:"))
+    async def uid_button(client: Client, query):
+        uid = query.data.split(":", 1)[1]
+        await query.answer(f"User ID: {uid}", show_alert=True)
+
     @app.on_chat_member_updated()
     async def member_update(client: Client, cmu: ChatMemberUpdated):
         if not cmu.new_chat_member:
@@ -283,8 +324,17 @@ def register_group_commands(app: Client):
         old_status = cmu.old_chat_member.status if cmu.old_chat_member else None
         new_status = cmu.new_chat_member.status
 
-        if new_status == ChatMemberStatus.MEMBER and old_status != ChatMemberStatus.MEMBER:
+        joined_statuses = {ChatMemberStatus.MEMBER, ChatMemberStatus.ADMINISTRATOR, ChatMemberStatus.OWNER}
+        left_statuses   = {ChatMemberStatus.LEFT, ChatMemberStatus.BANNED}
+
+        if new_status == ChatMemberStatus.MEMBER and old_status not in joined_statuses:
+            # User joined
             await handle_welcome(client, cmu.chat.id, [user], cmu.chat.title)
+            await _log_member_event(client, "join", cmu.chat.id, cmu.chat.title, user)
+
+        elif old_status in joined_statuses and new_status in left_statuses:
+            # User left or was removed
+            await _log_member_event(client, "leave", cmu.chat.id, cmu.chat.title, user)
 
     @app.on_message(filters.group & filters.new_chat_members)
     async def new_member_message(client: Client, message: Message):
