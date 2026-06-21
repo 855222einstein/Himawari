@@ -44,6 +44,7 @@ import logging
 import random
 import re
 import time
+from datetime import datetime, timezone, timedelta
 from pyrogram import filters
 from pyrogram.enums import ChatMemberStatus
 from pyrogram.errors import (
@@ -73,8 +74,15 @@ DEFAULT_FSUB_MSG = (
 
 NOTICE_TTL = 30          # seconds — notice/sticker auto-delete window & stage timeout
 STICKER_TTL = 10         # seconds — sticker auto-delete delay
-MUTE_SECONDS = 30        # seconds — temporary mute duration
 ADMIN_WARN_COOLDOWN = 1800  # seconds — how often to remind admin about broken channels
+
+# Escalating mute durations per Stage-3 hit.
+# None = permanent restriction (user can no longer send messages in this group).
+ESCALATION_DURATIONS: list[int | None] = [
+    30,          # 1st hit — 30 seconds
+    30,          # 2nd hit — 30 seconds
+    None,        # 3rd+ hit — permanent restriction
+]
 
 # Tracks last time admin was warned per chat: {chat_id: timestamp}
 _ADMIN_WARN_LAST: dict[int, float] = {}
@@ -84,13 +92,6 @@ MUTE_PERMISSIONS = ChatPermissions(
     can_send_media_messages=False,
     can_send_other_messages=False,
     can_add_web_page_previews=False,
-)
-
-FULL_PERMISSIONS = ChatPermissions(
-    can_send_messages=True,
-    can_send_media_messages=True,
-    can_send_other_messages=True,
-    can_add_web_page_previews=True,
 )
 
 # Pre-defined sticker file_ids used at Stage 1.
@@ -622,8 +623,9 @@ def register_force_sub_plugin(app):
                         logger.warning("Could not send admin warning: %s", e)
 
             if not unjoined:
-                # Subscribed to everything accessible — clear any stale state, let message through.
+                # Subscribed to everything accessible — clear stale state, reset escalation counter.
                 _clear_state(chat_id, user_id)
+                asyncio.create_task(db.reset_fsub_restrict_count(chat_id, user_id))
                 return
 
             state = _get_state(chat_id, user_id)
@@ -651,12 +653,23 @@ def register_force_sub_plugin(app):
                     _clear_state(chat_id, user_id)
 
             elif stage == 1:
-                # ── Stage 1: random sticker, replying to the notice ──────
-                # If the notice was already auto-deleted, fall back to plain send.
-                sticker_id = random.choice(_FORCE_SUB_STICKERS_RAW)
+                # ── Stage 1: random sticker + refresh notice buttons ─────
+                # Change 1 — Smart Join Buttons: edit the original notice to show
+                # ONLY channels still unjoined (user may have joined one since Stage 0).
                 notice_id = state.get("notice_id") if state else None
+                if notice_id:
+                    try:
+                        await client.edit_message_reply_markup(
+                            chat_id,
+                            notice_id,
+                            reply_markup=_join_keyboard(unjoined),
+                        )
+                    except (MessageIdInvalid, Exception):
+                        pass  # notice already deleted — fine, sticker will still go out
+
+                sticker_id = random.choice(_FORCE_SUB_STICKERS_RAW)
                 sticker_msg = None
-                # Try with reply first
+                # Try replying to the notice first
                 if notice_id:
                     try:
                         sticker_msg = await client.send_sticker(
@@ -668,7 +681,7 @@ def register_force_sub_plugin(app):
                         if not isinstance(e, MessageIdInvalid):
                             logger.error("Failed to send fsub sticker (with reply): %s", e)
                         sticker_msg = None
-                # Fallback: send without reply if reply failed or notice_id was None
+                # Fallback: send without reply
                 if sticker_msg is None:
                     try:
                         sticker_msg = await client.send_sticker(chat_id, sticker_id)
@@ -679,22 +692,49 @@ def register_force_sub_plugin(app):
                 _set_state(chat_id, user_id, stage=2, notice_id=notice_id)
 
             else:
-                # ── Stage 2: temporary mute (30s), then full cycle reset ──
-                try:
-                    await client.restrict_chat_member(chat_id, user_id, MUTE_PERMISSIONS)
-                except Exception as e:
-                    logger.warning("Could not mute user %s in %s: %s", user_id, chat_id, e)
+                # ── Stage 2: escalating restriction ─────────────────────
+                # Change 2+3: use until_date for timed restrictions (shows timer to user)
+                # and escalate on each repeat offence.
+                offense = await db.increment_fsub_restrict_count(chat_id, user_id)
+                idx = min(offense - 1, len(ESCALATION_DURATIONS) - 1)
+                duration = ESCALATION_DURATIONS[idx]
 
-                # Clear state immediately — cycle fully resets once mute lifts.
                 _clear_state(chat_id, user_id)
 
-                async def _unmute_later(cid=chat_id, uid=user_id):
-                    await asyncio.sleep(MUTE_SECONDS)
+                if duration is None:
+                    # 3rd+ offense — permanent restriction
                     try:
-                        await client.restrict_chat_member(cid, uid, FULL_PERMISSIONS)
+                        await client.restrict_chat_member(
+                            chat_id, user_id, MUTE_PERMISSIONS
+                            # no until_date → permanent
+                        )
+                        await client.send_message(
+                            chat_id,
+                            f"🚫 {message.from_user.mention} has been **permanently restricted** "
+                            f"for repeatedly ignoring the force-subscribe requirement.\n\n"
+                            f"An admin can lift this with `/unmute` if they later join the channels.",
+                            disable_web_page_preview=True,
+                        )
                     except Exception as e:
-                        logger.warning("Could not unmute user %s in %s: %s", uid, cid, e)
-
-                asyncio.create_task(_unmute_later())
+                        logger.warning("Could not permanently restrict %s in %s: %s", user_id, chat_id, e)
+                else:
+                    # 1st / 2nd offense — timed restriction using until_date
+                    # Telegram shows the user exactly when they'll be unmuted.
+                    until = datetime.now(timezone.utc) + timedelta(seconds=duration)
+                    label = "30 seconds"
+                    try:
+                        await client.restrict_chat_member(
+                            chat_id, user_id, MUTE_PERMISSIONS,
+                            until_date=until,
+                        )
+                        await client.send_message(
+                            chat_id,
+                            f"⏱️ {message.from_user.mention} has been muted for **{label}** "
+                            f"(offense #{offense}) for ignoring the force-subscribe notice.\n\n"
+                            f"Join the required channel(s) before the timer ends!",
+                            disable_web_page_preview=True,
+                        )
+                    except Exception as e:
+                        logger.warning("Could not restrict %s in %s: %s", user_id, chat_id, e)
 
         message.stop_propagation()

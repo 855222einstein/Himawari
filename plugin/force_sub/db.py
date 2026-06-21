@@ -118,6 +118,8 @@ async def clear_group_data(chat_id: int):
     await db.locks.delete_one({"chat_id": chat_id})
     await db.warns.delete_many({"chat_id": chat_id})
     await db.group_approvals.delete_one({"chat_id": chat_id})
+    await db.fsub.delete_one({"chat_id": chat_id})
+    await db.fsub_restrictions.delete_many({"chat_id": chat_id})
 
 
 # ==========================================================
@@ -218,3 +220,30 @@ async def clear_fsub_message(chat_id: int):
         {"$unset": {"message": ""}},
         upsert=True,
     )
+
+
+# ==========================================================
+# 🚫 Force Subscribe — Restriction Escalation Counter
+# ==========================================================
+
+async def get_fsub_restrict_count(chat_id: int, user_id: int) -> int:
+    """How many times this user has hit Stage 3 (mute) in this chat."""
+    data = await db.fsub_restrictions.find_one({"chat_id": chat_id, "user_id": user_id})
+    return data.get("count", 0) if data else 0
+
+
+async def increment_fsub_restrict_count(chat_id: int, user_id: int) -> int:
+    """Increment and return the new restriction count."""
+    data = await db.fsub_restrictions.find_one({"chat_id": chat_id, "user_id": user_id})
+    new_count = (data.get("count", 0) if data else 0) + 1
+    await db.fsub_restrictions.update_one(
+        {"chat_id": chat_id, "user_id": user_id},
+        {"$set": {"count": new_count}},
+        upsert=True,
+    )
+    return new_count
+
+
+async def reset_fsub_restrict_count(chat_id: int, user_id: int):
+    """Reset restriction count when user finally joins all channels."""
+    await db.fsub_restrictions.delete_one({"chat_id": chat_id, "user_id": user_id})
